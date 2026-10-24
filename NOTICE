@@ -1,0 +1,16 @@
+GazeHop
+Copyright (c) 2026 Aahan Piplani. Licensed under the MIT License (see LICENSE).
+
+This repository bundles third-party model files:
+
+Sources/GlanceKit/Tracking/Models/face_detector.onnx
+Sources/GlanceKit/Tracking/Models/face_landmarks_detector.onnx
+  Converted to ONNX (tf2onnx 1.16.1, opset 13) from the MediaPipe Face Landmarker
+  model bundle (face_landmarker.task, float16 v1):
+  https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
+  Copyright 2023 Google LLC. Licensed under the Apache License, Version 2.0:
+  https://www.apache.org/licenses/LICENSE-2.0
+  Modification: format conversion from TFLite to ONNX only; weights unchanged.
+
+Dependency (fetched by Swift Package Manager, not vendored):
+  ONNX Runtime (onnxruntime-swift-package-manager 1.19.2), Copyright Microsoft Corporation, MIT License.
