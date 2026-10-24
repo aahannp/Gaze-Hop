@@ -153,7 +153,7 @@ public final class CalibrationController: Calibrating {
     struct Plan { var display: Displays.Info; var points: [CGPoint] }   // dot points, CG global
 
     struct Step {
-        enum Kind: Equatable { case range(label: String, arrow: String), dot }
+        enum Kind: Equatable { case range(label: String, arrow: String), dot, eyeDot }
         var display: Displays.Info
         var target: CGPoint
         var kind: Kind
@@ -172,6 +172,9 @@ public final class CalibrationController: Calibrating {
     var verifyPassFraction = 0.6
     var minPoses = 3
     var minPoseConfidence = 0.5
+    /// Eyes-only phase: max spread (radians) of head yaw / pitch while a dot is collected.
+    var maxHeadSpread = 0.05
+    var eyePhaseExtraDelay: TimeInterval = 2.5
     /// Demo only: start and finish without waiting for the user.
     var autoAdvance = false
 
@@ -194,6 +197,8 @@ public final class CalibrationController: Calibrating {
     private(set) var isRunning = false
     /// Where the user is expected to look right now (CG global). The demo uses it to fake a gaze.
     private(set) var currentTarget: CGPoint?
+    /// True while the eyes-only phase is on: the head should stay where it is (the demo uses it too).
+    private(set) var currentEyesOnly = false
 
     public init() {}
 
@@ -253,6 +258,20 @@ public final class CalibrationController: Calibrating {
         }
         out += plan.points.map { Step(display: plan.display, target: $0, kind: .dot, firstOnDisplay: false) }
         return out
+    }
+
+    /// Eyes-only dots for one display: centre, four mid-edge points and the shared-edge points.
+    static func makeEyeSteps(for plan: Plan) -> [Step] {
+        let f = plan.display.frame
+        func pt(_ fx: Double, _ fy: Double) -> CGPoint { CGPoint(x: f.minX + f.width * fx, y: f.minY + f.height * fy) }
+        var targets = [pt(0.5, 0.5), pt(0.15, 0.5), pt(0.85, 0.5), pt(0.5, 0.15), pt(0.5, 0.85)]
+        targets += plan.points.dropFirst(9)   // shared-edge points
+        return targets.map { Step(display: plan.display, target: $0, kind: .eyeDot, firstOnDisplay: false) }
+    }
+
+    /// Head range + dots for every display, then the head-still eyes-only dots for every display.
+    static func allSteps(for plans: [Plan]) -> [Step] {
+        plans.flatMap { makeSteps(for: $0) } + plans.flatMap { makeEyeSteps(for: $0) }
     }
 
     static func average(_ poses: [HeadPose]) -> HeadPose? {
@@ -426,7 +445,7 @@ public final class CalibrationController: Calibrating {
     private func startCalibration() {
         guard phase == .intro || phase == .idle else { return }
         mapper?.reset()   // only the current arrangement's profile
-        steps = plans.flatMap { Self.makeSteps(for: $0) }
+        steps = Self.allSteps(for: plans)
         stepIndex = 0
         clearButtons()
         phase = .steps
@@ -463,7 +482,14 @@ public final class CalibrationController: Calibrating {
         case .dot:
             settle = settleTime
             setText(title: "Follow the dot with your eyes and head", subtitle: progressText(), active: id)
+        case .eyeDot:
+            settle = settleTime
+            let firstEye = stepIndex == 0 || steps[stepIndex - 1].kind != .eyeDot
+            setText(title: "Keep your head still, follow the dot with your eyes only", subtitle: progressText(),
+                    big: "HEAD STILL", active: id)
+            if firstEye { settle += eyePhaseExtraDelay }
         }
+        currentEyesOnly = step.kind == .eyeDot
         if newDisplay { settle += firstPointExtraDelay }
         if retry { settle += 0.3 }
 
@@ -496,7 +522,23 @@ public final class CalibrationController: Calibrating {
             after(1.2) { [weak self] in self?.beginStep(retry: true) }
             return
         }
-        mapper.addSample(avg, target: step.target, weight: 1.0)
+        if step.kind == .eyeDot {
+            // The head must not have moved while only the eyes were supposed to.
+            func spread(_ k: (HeadPose) -> Double) -> Double {
+                let v = collected.map(k); return (v.max() ?? 0) - (v.min() ?? 0)
+            }
+            if spread({ $0.yaw }) > maxHeadSpread || spread({ $0.pitch }) > maxHeadSpread {
+                setText(title: "Hold your head still", subtitle: "Move only your eyes — retrying…", big: "HEAD STILL",
+                        active: step.display.id, other: "Hold your head still", titleColor: .systemOrange)
+                after(1.2) { [weak self] in self?.beginStep(retry: true) }
+                return
+            }
+        }
+        if let r = mapper as? RegressionGazeMapper {
+            r.addSample(avg, target: step.target, weight: 1.0, eyesOnly: step.kind == .eyeDot)
+        } else {
+            mapper.addSample(avg, target: step.target, weight: 1.0)
+        }
         stepIndex += 1
         if stepIndex >= steps.count { fitAndVerify() } else { beginStep() }
     }
@@ -508,7 +550,7 @@ public final class CalibrationController: Calibrating {
             return
         }
         do { try mapper.save() } catch { NSLog("Glance: calibration save failed: \(error)") }
-        currentTarget = nil
+        currentTarget = nil; currentEyesOnly = false
         hideDots()
         verifyResults = [:]; verifyIndex = 0
         phase = .verify
@@ -579,7 +621,7 @@ public final class CalibrationController: Calibrating {
     private func redoFailed() {
         let failed = Set(plans.map { $0.display.id }.filter { verifyResults[$0] != true })
         guard phase == .summary, !failed.isEmpty else { return }
-        steps = plans.filter { failed.contains($0.display.id) }.flatMap { Self.makeSteps(for: $0) }
+        steps = Self.allSteps(for: plans.filter { failed.contains($0.display.id) })
         stepIndex = 0
         for (_, v) in views { v.big.textColor = NSColor.white.withAlphaComponent(0.95) }
         clearButtons()
@@ -635,10 +677,13 @@ extension CalibrationController {
             let t = controller.currentTarget ?? center
             func n() -> Double { Double.random(in: -0.004...0.004, using: &rng) }
             // Fake linear head model: angles proportional to target offset from desktop centre.
-            let yaw = Double(t.x - center.x) / 4500 + n(), pitch = -Double(t.y - center.y) / 3000 + n()
+            // Eyes-only phase: the head stays put, only the eyes follow the target.
+            let h = controller.currentEyesOnly ? center : t
+            let yaw = Double(h.x - center.x) / 4500 + n(), pitch = -Double(h.y - center.y) / 3000 + n()
+            let ex = Double(t.x - center.x) / 4500 * 0.3, ey = -Double(t.y - center.y) / 3000 * 0.3
             hub.publish(HeadPose(timestamp: ProcessInfo.processInfo.systemUptime, yaw: yaw, pitch: pitch, roll: 0,
                                  faceCenter: CGPoint(x: 0.5 + yaw * 0.1, y: 0.5 - pitch * 0.1), faceSize: 0.3,
-                                 eyeOffset: CGVector(dx: yaw * 0.3, dy: pitch * 0.3), confidence: 0.9))
+                                 eyeOffset: CGVector(dx: ex + n(), dy: ey + n()), confidence: 0.9))
         }
         controller.run(hub: hub, mapper: mapper) { ok in
             timer.invalidate()

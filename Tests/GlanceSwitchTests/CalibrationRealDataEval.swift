@@ -127,3 +127,42 @@ extension CalibrationRealDataEval {
         }
     }
 }
+
+extension CalibrationRealDataEval {
+    /// Per gaze mode on the real profile (leave-one-out). The real file has no eyes-only phase, so eyes / both
+    /// fall back to head ("needsEyeCalibration"); `treatAllAsEyes` shows what the eye component alone could do.
+    func testReportPerMode() throws {
+        guard let raw = Self.loadRaw() else { throw XCTSkip("no real calibration profile") }
+        let cal = raw.indices.filter { raw[$0].w >= 0.9 }
+        let minPitch = raw.map { $0.f[1] }.min()!
+        func nearEdge(_ r: Raw) -> Bool { r.x < 0 ? r.x > -0.2 * 1470 : r.x < 0.2 * 2560 }
+        for (name, mode, w, asEyes) in [("head", GazeMode.head, 0.0, false), ("eyes (real file, fallback)", .eyes, 1.0, false),
+                                        ("both 0.7 (real file, fallback)", .both, 0.7, false),
+                                        ("eyes (indicative: all samples as eye data)", .eyes, 1.0, true),
+                                        ("both 0.7 (indicative)", .both, 0.7, true)] {
+            var fExt = 0, nExt = 0, fKb = 0, fLap = 0, nLap = 0, missFar = 0, nFar = 0, missEdge = 0, nEdge = 0, fallback = 0
+            for i in cal {
+                let m = RegressionGazeMapper(url: FileManager.default.temporaryDirectory.appendingPathComponent("eval-\(UUID()).json"),
+                                             displays: { Self.displays })
+                m.treatAllAsEyes = asEyes
+                for j in cal where j != i { m.addSample(Self.pose(raw[j].f), target: CGPoint(x: raw[j].x, y: raw[j].y), weight: raw[j].w) }
+                XCTAssertTrue(m.fit())
+                if m.needsEyeCalibration { fallback += 1 }
+                m.gazeMode = mode; m.eyeWeight = w
+                let r = raw[i]
+                func e(_ p: HeadPose, _ cur: DisplayID) -> DisplayID? { m.estimate(p, currentDisplay: cur, edgeBias: 0.5, displays: Self.displays)?.displayID }
+                if Self.label(r) == 2 {
+                    nExt += 1
+                    if e(Self.pose(r.f), 2) == 1 { fExt += 1 }
+                    if e(Self.pose(r.f, pitch: minPitch - 0.3), 2) == 1 { fKb += 1 }
+                    if nearEdge(r) { nEdge += 1; if e(Self.pose(r.f), 1) != 2 { missEdge += 1 } } else { nFar += 1; if e(Self.pose(r.f), 1) != 2 { missFar += 1 } }
+                } else {
+                    nLap += 1
+                    if e(Self.pose(r.f), 1) == 2 { fLap += 1 }
+                    if nearEdge(r) { nEdge += 1; if e(Self.pose(r.f), 2) != 1 { missEdge += 1 } } else { nFar += 1; if e(Self.pose(r.f), 2) != 1 { missFar += 1 } }
+                }
+            }
+            print("MODE \(name): false ext->lap \(fExt)/\(nExt), keyboard \(fKb)/\(nExt), lap->ext \(fLap)/\(nLap) | miss non-edge \(missFar)/\(nFar), edge \(missEdge)/\(nEdge) | folds needing eye calibration \(fallback)/\(cal.count)")
+        }
+    }
+}
