@@ -1,6 +1,8 @@
-// OWNER: App worker. Menu bar shell wiring tracker -> hub -> engine -> focus.
+// OWNER: App worker. App shell wiring tracker -> hub -> engine -> focus.
+// UI worker: main window, menus and status (the "Status item & menus" and "Windows" sections).
 import AppKit
 import SwiftUI
+import Combine
 import Carbon.HIToolbox
 import UserNotifications
 
@@ -9,7 +11,8 @@ public enum GlanceApp {
 
     public static func run() {
         let app = NSApplication.shared
-        app.setActivationPolicy(.accessory)
+        // A regular Dock app with a main window (Info.plist still says LSUIElement; this overrides it).
+        app.setActivationPolicy(.regular)
         let d = AppController()
         delegate = d
         app.delegate = d
@@ -23,7 +26,7 @@ protocol EyeCalibrationReporting: AnyObject { var needsEyeCalibration: Bool { ge
 
 extension RegressionGazeMapper: EyeCalibrationReporting {}
 
-final class AppController: NSObject, NSApplicationDelegate {
+final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let store = SettingsStore()
     private let hub = PoseHub()
     private var tracker: PoseSource = PoseTrackerFactory.make()
@@ -36,15 +39,23 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var liveWindow: NSWindow?
     private var engine: SwitchEngine!
 
+    private let status = AppStatus()
+    private let router = SettingsRouter()
+    private var subscriptions = Set<AnyCancellable>()
+
     private var statusItem: NSStatusItem!
+    private var statusLineItem: NSMenuItem!
     private var pauseItem: NSMenuItem!
     private var driftItem: NSMenuItem!
     private var inputWarnItem: NSMenuItem!
+    private var updateItem: NSMenuItem!
     private var inputStarted = false
     private var permissionTimer: Timer?
     private var hotKey: HotKey?
     private var welcomeWindow: NSWindow?
-    private var settingsWindow: NSWindow?
+    private var mainWindow: NSWindow?
+    /// First run: open the main window once the first calibration ends.
+    private var showMainAfterCalibration = false
 
     private var calibrating = false
     private var suspendReasons = Set<String>()
@@ -66,9 +77,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         engine = SwitchEngine(mapper: mapper, focus: focus, input: input, settings: { [weak self] in
             self?.store.settings ?? Settings()
         })
-        engine.onStateChange = { [weak self] in
-            self?.overlay.update($0)
-            self?.liveModel.update(state: $0)
+        engine.onStateChange = { [weak self] state in
+            self?.overlay.update(state)
+            self?.liveModel.update(state: state)
+            self?.status.update { $0.currentDisplay = state.currentDisplay }   // publishes only on a switch
         }
         engine.onDriftSuggested = { [weak self] in self?.suggestRecalibration(reason: "Gaze accuracy seems to have dropped.") }
 
@@ -80,11 +92,15 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         store.onChange = { [weak self] old, new in self?.settingsChanged(old, new) }
 
+        buildMainMenu()
         buildStatusItem()
+        status.$value.removeDuplicates().sink { [weak self] in self?.applyStatus($0) }.store(in: &subscriptions)
+        Updater.shared.$state.removeDuplicates().sink { [weak self] in self?.applyUpdateState($0) }.store(in: &subscriptions)
+        Updater.shared.start()
         hotKey = HotKey(keyCode: UInt32(kVK_ANSI_G), modifiers: UInt32(cmdKey | shiftKey)) { [weak self] in
             self?.togglePause()
         }
-        if hotKey == nil { NSLog("Glance: could not register ⇧⌘G hotkey") }
+        if hotKey == nil { NSLog("GazeHop: could not register ⇧⌘G hotkey") }
         observeSystemEvents()
 
         focus.startTracking()
@@ -93,67 +109,228 @@ final class AppController: NSObject, NSApplicationDelegate {
             self?.ensureInputMonitor()
         }
         overlay.setVisible(store.settings.showGazeDot)
-        refreshStatusIcon()
+        refreshStatus()
 
+        // Input Monitoring is optional (typing protection); the menu and Overview flag it when missing.
         let firstLaunch = !UserDefaults.standard.bool(forKey: welcomeShownKey)
-        if firstLaunch || !Permissions.cameraGranted || !Permissions.accessibilityGranted || !Permissions.inputMonitoringGranted {
+        if firstLaunch || !Permissions.cameraGranted || !Permissions.accessibilityGranted {
             showWelcome()
         } else if !mapper.isCalibrated {
+            showMainAfterCalibration = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.startCalibration() }
         } else {
             updateCamera()
+            showMainWindow()
         }
+    }
+
+    /// Dock icon clicked (or the app opened again): bring the main window back.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if let w = welcomeWindow, w.isVisible { present(w) } else { showMainWindow() }
+        return false
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         tracker.stop(); input.stop()
     }
 
-    // MARK: Status item & menu
+    // MARK: Status item & menus
 
     private func buildStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         let menu = NSMenu()
-        pauseItem = NSMenuItem(title: "Pause Tracking", action: #selector(togglePauseAction), keyEquivalent: "g")
-        pauseItem.keyEquivalentModifierMask = [.command, .shift]
-        driftItem = NSMenuItem(title: "⚠︎ Accuracy dropped — Recalibrate", action: #selector(recalibrateAction), keyEquivalent: "")
-        driftItem.isHidden = true
-        inputWarnItem = NSMenuItem(title: "⚠︎ Input Monitoring missing — Fix…", action: #selector(openWelcome), keyEquivalent: "")
-        inputWarnItem.target = self
+        menu.delegate = self
+        statusLineItem = item("Tracking", #selector(openMainWindowAction))
+        menu.addItem(statusLineItem)
+        inputWarnItem = item("Allow Input Monitoring…", #selector(openWelcome), symbol: "exclamationmark.triangle.fill", tint: .systemOrange)
         inputWarnItem.isHidden = true
         menu.addItem(inputWarnItem)
-        menu.addItem(pauseItem)
+        driftItem = item("Accuracy Dropped — Recalibrate…", #selector(recalibrateAction), symbol: "exclamationmark.triangle.fill", tint: .systemOrange)
+        driftItem.isHidden = true
         menu.addItem(driftItem)
-        menu.addItem(item("Recalibrate…", #selector(recalibrateAction), key: "r"))
+        updateItem = item("Update Available…", #selector(openUpdates), symbol: "arrow.down.circle.fill", tint: .controlAccentColor)
+        updateItem.isHidden = true
+        menu.addItem(updateItem)
         menu.addItem(.separator())
-        menu.addItem(item("Live Face…", #selector(openLiveFace)))
-        menu.addItem(item("Settings…", #selector(openSettings), key: ","))
-        menu.addItem(item("Welcome Guide", #selector(openWelcome)))
+        pauseItem = item("Pause Tracking", #selector(togglePauseAction), key: "g", symbol: "pause")
+        pauseItem.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(pauseItem)
+        menu.addItem(item("Recalibrate…", #selector(recalibrateAction), key: "r", symbol: "scope"))
+        menu.addItem(item("Live Face…", #selector(openLiveFace), symbol: "face.smiling"))
         menu.addItem(.separator())
-        menu.addItem(item("Quit Glance Switch", #selector(quit), key: "q"))
+        menu.addItem(item("Settings…", #selector(openSettings), key: ",", symbol: "gearshape"))
+        menu.addItem(item("Check for Updates…", #selector(checkForUpdatesAction), symbol: "arrow.triangle.2.circlepath"))
+        menu.addItem(.separator())
+        menu.addItem(item("Quit GazeHop", #selector(quit), key: "q", symbol: "power"))
         statusItem.menu = menu
     }
 
-    private func item(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
+    /// The app menu bar shown while GazeHop is the active app.
+    private func buildMainMenu() {
+        let app = NSMenu(title: "GazeHop")
+        app.addItem(item("About GazeHop", #selector(openAbout)))
+        app.addItem(item("Check for Updates…", #selector(checkForUpdatesAction)))
+        app.addItem(.separator())
+        app.addItem(item("Settings…", #selector(openSettings), key: ","))
+        app.addItem(.separator())
+        let services = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
+        services.submenu = NSMenu(title: "Services")
+        NSApp.servicesMenu = services.submenu
+        app.addItem(services)
+        app.addItem(.separator())
+        app.addItem(NSMenuItem(title: "Hide GazeHop", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
+        let hideOthers = NSMenuItem(title: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+        hideOthers.keyEquivalentModifierMask = [.command, .option]
+        app.addItem(hideOthers)
+        app.addItem(NSMenuItem(title: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: ""))
+        app.addItem(.separator())
+        app.addItem(item("Quit GazeHop", #selector(quit), key: "q"))
+
+        let file = NSMenu(title: "File")
+        file.addItem(NSMenuItem(title: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
+
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(NSMenuItem(title: "Undo", action: Selector(("undo:")), keyEquivalent: "z"))
+        let redo = NSMenuItem(title: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(redo)
+        edit.addItem(.separator())
+        edit.addItem(NSMenuItem(title: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x"))
+        edit.addItem(NSMenuItem(title: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c"))
+        edit.addItem(NSMenuItem(title: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v"))
+        edit.addItem(NSMenuItem(title: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a"))
+
+        let tracking = NSMenu(title: "Tracking")
+        tracking.addItem(item("Pause Tracking", #selector(togglePauseAction)))   // ⇧⌘G is the global hotkey
+        tracking.addItem(item("Recalibrate…", #selector(recalibrateAction), key: "r"))
+        tracking.addItem(item("Live Face…", #selector(openLiveFace)))
+        tracking.delegate = self
+
+        let window = NSMenu(title: "Window")
+        window.addItem(NSMenuItem(title: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
+        window.addItem(NSMenuItem(title: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: ""))
+        window.addItem(.separator())
+        window.addItem(item("GazeHop", #selector(openMainWindowAction), key: "0"))
+        window.addItem(.separator())
+        window.addItem(NSMenuItem(title: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: ""))
+        NSApp.windowsMenu = window
+
+        let help = NSMenu(title: "Help")
+        help.addItem(item("GazeHop on GitHub", #selector(openProjectPage)))
+        NSApp.helpMenu = help
+
+        let main = NSMenu()
+        for m in [app, file, edit, tracking, window, help] {
+            let top = NSMenuItem(title: m.title, action: nil, keyEquivalent: "")
+            top.submenu = m
+            main.addItem(top)
+        }
+        NSApp.mainMenu = main
+    }
+
+    private func item(_ title: String, _ action: Selector, key: String = "", symbol: String? = nil,
+                      tint: NSColor? = nil) -> NSMenuItem {
         let i = NSMenuItem(title: title, action: action, keyEquivalent: key)
         i.target = self
+        if let symbol { i.image = Self.menuImage(symbol, tint: tint) }
         return i
     }
 
-    private func refreshStatusIcon() {
-        let paused = store.settings.paused
-        pauseItem.title = paused ? "Resume Tracking" : "Pause Tracking"
-        let img = NSImage(systemSymbolName: paused ? "eye.slash" : "eye", accessibilityDescription: "Glance Switch")
+    private static func menuImage(_ name: String, tint: NSColor? = nil, size: CGFloat = 13) -> NSImage? {
+        guard let img = NSImage(systemSymbolName: name, accessibilityDescription: nil) else { return nil }
+        var config = NSImage.SymbolConfiguration(pointSize: size, weight: .regular)
+        if let tint { config = config.applying(.init(paletteColors: [tint])) }
+        let out = img.withSymbolConfiguration(config)
+        out?.isTemplate = tint == nil
+        return out
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        refreshStatus()
+        let paused = status.value.paused
+        for item in menu.items where item.action == #selector(togglePauseAction) {
+            item.title = paused ? "Resume Tracking" : "Pause Tracking"
+        }
+    }
+
+    /// Recomputes the slow-changing status. Publishes (and redraws anything) only if it changed.
+    private func refreshStatus() {
+        status.update {
+            $0.paused = store.settings.paused
+            $0.calibrated = mapper.isCalibrated
+            $0.calibrating = calibrating
+            $0.needsEyeCalibration = (mapper as? EyeCalibrationReporting)?.needsEyeCalibration ?? false
+            $0.cameraAllowed = Permissions.cameraGranted
+            $0.accessibilityAllowed = Permissions.accessibilityGranted
+            $0.inputMonitoringAllowed = Permissions.inputMonitoringGranted
+            $0.cameraError = lastCameraError
+            $0.suspended = !suspendReasons.isEmpty
+            $0.trackerKind = trackerKind
+            $0.displayCount = max(Displays.all().count, 1)
+        }
+    }
+
+    /// Menu bar icon, tooltip and menu lines for the current status.
+    private func applyStatus(_ v: AppStatusValue) {
+        guard statusItem != nil else { return }
+        let summary = StatusSummary(v)
+        let iconName: String
+        if v.calibrating { iconName = "scope" }
+        else if summary.tone == .attention { iconName = "eye.trianglebadge.exclamationmark" }
+        else if v.paused { iconName = "eye.slash" }
+        else { iconName = "eye" }
+        let img = NSImage(systemSymbolName: iconName, accessibilityDescription: "GazeHop")
+            ?? NSImage(systemSymbolName: "eye", accessibilityDescription: "GazeHop")
         img?.isTemplate = true
         statusItem.button?.image = img
-        var tip = paused ? "Glance Switch — paused" : "Glance Switch"
-        if let e = lastCameraError { tip += "\nCamera: \(e)" }
+
+        var tip = "GazeHop — \(StatusSummary.menuLine(v))"
+        if let e = v.cameraError { tip += "\nCamera: \(e)" }
+        if !v.inputMonitoringAllowed { tip += "\nInput Monitoring is off, so typing protection is off." }
+        if !driftItem.isHidden { tip += "\nAccuracy dropped. Choose Recalibrate." }
         statusItem.button?.toolTip = tip
+
+        let line = StatusSummary.menuLine(v)
+        statusLineItem.attributedTitle = NSAttributedString(string: line, attributes: [
+            .font: NSFont.systemFont(ofSize: NSFont.systemFontSize, weight: .semibold),
+        ])
+        statusLineItem.title = line
+        statusLineItem.image = Self.menuImage("circle.fill", tint: summary.nsColor, size: 9)
+        statusLineItem.toolTip = summary.detail
+        pauseItem.title = v.paused ? "Resume Tracking" : "Pause Tracking"
+        pauseItem.image = Self.menuImage(v.paused ? "play" : "pause")
+        inputWarnItem.isHidden = v.inputMonitoringAllowed
+    }
+
+    private func applyUpdateState(_ state: UpdateState) {
+        guard updateItem != nil else { return }
+        switch state {
+        case .available(let version, _):
+            updateItem.title = "Update to \(UpdateStatusView.display(version))…"
+            updateItem.isHidden = false
+        case .downloading(let p):
+            updateItem.title = "Downloading Update… \(Formats.percent(min(max(p, 0), 1)))"
+            updateItem.isHidden = false
+        case .installing:
+            updateItem.title = "Installing Update…"
+            updateItem.isHidden = false
+        default:
+            updateItem.isHidden = true
+        }
     }
 
     @objc private func togglePauseAction() { togglePause() }
-    @objc private func recalibrateAction() { recalibrate() }
+    @objc private func recalibrateAction() { recalibrateOrCalibrate() }
     @objc private func quit() { NSApp.terminate(nil) }
+    @objc private func openUpdates() { showMainWindow(pane: .about) }
+    @objc private func openAbout() { showMainWindow(pane: .about) }
+    @objc private func checkForUpdatesAction() {
+        showMainWindow(pane: .about)
+        Updater.shared.checkNow()
+    }
+    @objc private func openProjectPage() {
+        if let url = URL(string: "https://github.com/\(Updater.repo)") { NSWorkspace.shared.open(url) }
+    }
 
     // MARK: Tracker choice
 
@@ -174,7 +351,6 @@ final class AppController: NSObject, NSApplicationDelegate {
         try? mapper.load()
         syncMapperMode()
         updateCamera()   // starts it again if tracking is wanted (calibrated) or the live view is open
-        refreshStatusIcon()
     }
 
     func togglePause() { store.settings.paused.toggle() }
@@ -191,7 +367,7 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     private func settingsChanged(_ old: Settings, _ new: Settings) {
         if old.gazeMode != new.gazeMode || old.eyeWeight != new.eyeWeight { syncMapperMode() }
-        if old.paused != new.paused { engine.reset(); refreshStatusIcon() }
+        if old.paused != new.paused { engine.reset() }
         if old.showGazeDot != new.showGazeDot { overlay.setVisible(new.showGazeDot) }
         if old.cameraID != new.cameraID, tracker.isRunning { tracker.stop() }
         updateCamera()
@@ -211,8 +387,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         } else if !granted {
             inputStarted = false
         }
-        inputWarnItem?.isHidden = granted
-        if !granted { statusItem?.button?.toolTip = "Glance Switch — Input Monitoring not granted: typing protection is off" }
+        refreshStatus()
     }
 
     private func updateCamera() {
@@ -226,13 +401,13 @@ final class AppController: NSObject, NSApplicationDelegate {
                 lastCameraError = nil
             } catch {
                 lastCameraError = error.localizedDescription
-                NSLog("Glance: camera start failed: \(error)")
+                NSLog("GazeHop: camera start failed: \(error)")
             }
-            refreshStatusIcon()
         } else if !want, tracker.isRunning {
             tracker.stop()
             engine.reset()
         }
+        refreshStatus()
     }
 
     // MARK: System events
@@ -293,8 +468,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         driftItem.isHidden = false
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "Your displays changed — Recalibrate now?"
-        alert.informativeText = "Glance Switch has no calibration for this display arrangement, so tracking is paused until you recalibrate."
+        alert.messageText = "Your displays changed. Recalibrate now?"
+        alert.informativeText = "GazeHop has no calibration for this display arrangement, so tracking is paused until you recalibrate."
         alert.addButton(withTitle: "Recalibrate")
         alert.addButton(withTitle: "Later")
         let response = alert.runModal()
@@ -328,6 +503,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         ensureInputMonitor()
         driftItem.isHidden = true
         calibrating = true
+        refreshStatus()
         updateCamera()
         NSApp.activate(ignoringOtherApps: true)
         calibrator.run(hub: hub, mapper: mapper) { [weak self] ok in
@@ -341,18 +517,22 @@ final class AppController: NSObject, NSApplicationDelegate {
             }
             self.engine.reset()
             self.updateCamera()
+            if self.showMainAfterCalibration {
+                self.showMainAfterCalibration = false
+                self.showMainWindow()
+            }
         }
     }
 
     private func suggestRecalibration(reason: String) {
         driftItem.isHidden = false
-        statusItem.button?.toolTip = "Glance Switch — \(reason) Choose Recalibrate."
+        applyStatus(status.value)
         guard Bundle.main.bundleIdentifier != nil else { return }
         let center = UNUserNotificationCenter.current()
         center.requestAuthorization(options: [.alert]) { granted, _ in
             guard granted else { return }
             let c = UNMutableNotificationContent()
-            c.title = "Glance Switch"
+            c.title = "GazeHop"
             c.body = "\(reason) Recalibrate from the menu bar for best results."
             center.add(UNNotificationRequest(identifier: "glance.recalibrate", content: c, trigger: nil))
         }
@@ -361,7 +541,8 @@ final class AppController: NSObject, NSApplicationDelegate {
     // MARK: Windows
 
     @objc private func openWelcome() { showWelcome() }
-    @objc private func openSettings() { showSettings() }
+    @objc private func openSettings() { showMainWindow() }
+    @objc private func openMainWindowAction() { showMainWindow() }
     @objc private func openLiveFace() { showLiveFace() }
 
     private func showLiveFace() {
@@ -370,7 +551,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             let w = makeWindow(title: "Live Face", content: LiveFacePanel(model: liveModel).frame(width: 380, height: 640))
             w.styleMask = [.titled, .closable, .miniaturizable]
             // Dropping the content view on close fires onDisappear, which stops the hub subscription and rendering.
-            NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { [weak self] _ in
+            onClose(w) { [weak self] in
                 self?.liveWindow?.contentViewController = nil
                 self?.liveWindow = nil
             }
@@ -379,41 +560,76 @@ final class AppController: NSObject, NSApplicationDelegate {
         present(liveWindow!)
     }
 
+    /// The main window: Overview, settings and updates. Closing it leaves GazeHop running in the menu bar.
+    private func showMainWindow(pane: SettingsPane? = nil) {
+        if let pane { router.pane = pane }
+        if mainWindow == nil {
+            let actions = MainWindowActions(
+                setPaused: { [weak self] in self?.store.settings.paused = $0 },
+                recalibrate: { [weak self] in self?.recalibrateOrCalibrate() },
+                resetCalibration: { [weak self] in self?.resetCalibration() },
+                changeTracker: { [weak self] in self?.switchTracker(to: $0) },
+                showSetupGuide: { [weak self] in self?.showWelcome() },
+                checkForUpdates: { Updater.shared.checkNow() },
+                installUpdate: { Updater.shared.installUpdate() })
+            let view = SettingsView(router: router, store: store, status: status, updater: .shared,
+                                    meshAvailable: MeshModelPaths.locate() != nil,
+                                    cameras: CameraPoseTracker.availableCameras(),
+                                    actions: actions,
+                                    live: { [liveModel] in AnyView(LiveFacePanel(model: liveModel)) })
+            refreshStatus()
+            let w = WindowChrome.main(view)
+            if !w.setFrameUsingName(WindowChrome.mainAutosaveName) { w.center() }
+            w.setFrameAutosaveName(WindowChrome.mainAutosaveName)
+            // Dropping the content stops the live view, so the camera can turn off while the window is closed.
+            onClose(w) { [weak self] in
+                self?.mainWindow?.contentViewController = nil
+                self?.mainWindow = nil
+            }
+            mainWindow = w
+        }
+        present(mainWindow!)
+    }
+
     private func showWelcome() {
         UserDefaults.standard.set(true, forKey: welcomeShownKey)
         if welcomeWindow == nil {
-            let view = WelcomeView { [weak self] in
-                self?.welcomeWindow?.close()
-                self?.ensureInputMonitor()
-                if self?.mapper.isCalibrated == true, !(self?.store.settings.paused ?? false) {
-                    self?.updateCamera()
-                }
-                self?.recalibrateOrCalibrate()
+            let view = WelcomeView(
+                calibrated: mapper.isCalibrated,
+                onContinue: { [weak self] in
+                    guard let self else { return }
+                    self.welcomeWindow?.close()
+                    self.ensureInputMonitor()
+                    if self.mapper.isCalibrated {
+                        self.updateCamera()
+                        self.showMainWindow()
+                    } else {
+                        self.showMainAfterCalibration = true
+                        self.startCalibration()
+                    }
+                },
+                onRecalibrate: { [weak self] in
+                    self?.welcomeWindow?.close()
+                    self?.recalibrate()
+                },
+                onLater: { [weak self] in
+                    self?.welcomeWindow?.close()
+                    self?.showMainWindow()
+                })
+            let w = WindowChrome.panel(view, title: "Welcome to GazeHop", size: WelcomeView.size)
+            w.center()
+            // Dropping the content stops the permission polling.
+            onClose(w) { [weak self] in
+                self?.welcomeWindow?.contentViewController = nil
+                self?.welcomeWindow = nil
             }
-            welcomeWindow = makeWindow(title: "Welcome to Glance Switch", content: view)
+            welcomeWindow = w
         }
         present(welcomeWindow!)
     }
 
     private func recalibrateOrCalibrate() {
         mapper.isCalibrated ? recalibrate() : startCalibration()
-    }
-
-    private func showSettings() {
-        if settingsWindow == nil {
-            let view = SettingsView(store: store,
-                                    onRecalibrate: { [weak self] in self?.recalibrate() },
-                                    onResetCalibration: { [weak self] in self?.resetCalibration() },
-                                    liveModel: liveModel,
-                                    meshAvailable: MeshModelPaths.locate() != nil,
-                                    isCalibrated: { [weak self] in self?.mapper.isCalibrated ?? false },
-                                    onTrackerChange: { [weak self] in self?.switchTracker(to: $0) },
-                                    needsEyeCalibration: { [weak self] in
-                                        (self?.mapper as? EyeCalibrationReporting)?.needsEyeCalibration ?? false
-                                    })
-            settingsWindow = makeWindow(title: "Glance Switch Settings", content: view)
-        }
-        present(settingsWindow!)
     }
 
     private func makeWindow<V: View>(title: String, content: V) -> NSWindow {
@@ -424,6 +640,15 @@ final class AppController: NSObject, NSApplicationDelegate {
         w.isReleasedWhenClosed = false
         w.center()
         return w
+    }
+
+    /// Runs `body` once when `w` is about to close.
+    private func onClose(_ w: NSWindow, _ body: @escaping () -> Void) {
+        var token: NSObjectProtocol?
+        token = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { _ in
+            if let token { NotificationCenter.default.removeObserver(token) }
+            body()
+        }
     }
 
     private func present(_ w: NSWindow) {
