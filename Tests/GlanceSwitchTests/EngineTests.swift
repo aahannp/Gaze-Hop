@@ -40,6 +40,12 @@ private final class FakeInput: InputActivityMonitoring {
     func stop() {}
 }
 
+private final class FakeTrace: TraceLogging {
+    var isEnabled = true
+    var rows: [String] = []
+    func write(_ row: String) { rows.append(row) }
+}
+
 private final class FakeLog: LatencyLogging {
     var isEnabled = true
     var lines: [String] = []
@@ -48,6 +54,7 @@ private final class FakeLog: LatencyLogging {
 
 final class EngineTests: XCTestCase {
     private var fakeLog: FakeLog!
+    private var fakeTrace: FakeTrace!
     private var mapper: FakeMapper!
     private var focus: FakeFocus!
     private var input: FakeInput!
@@ -65,7 +72,7 @@ final class EngineTests: XCTestCase {
         // Pin the original timings so the behaviour tests below read the same; defaults are tested separately.
         settings = Settings(); settings.windowFocusEnabled = false
         settings.switchDelayMs = 300; settings.typingPauseSec = 2.0; settings.mousePriorityMs = 1500
-        fakeLog = FakeLog()
+        fakeLog = FakeLog(); fakeTrace = FakeTrace()
         clock = 100; scheduled = []
         engine = SwitchEngine(mapper: mapper, focus: focus, input: input,
                               settings: { [unowned self] in self.settings },
@@ -73,7 +80,7 @@ final class EngineTests: XCTestCase {
                               displayFrame: { [unowned self] in self.frames[$0] },
                               displayAt: { [unowned self] p in self.frames.first { $0.value.contains(p) }?.key },
                               schedule: { [unowned self] _, b in self.scheduled.append(b) },
-                              latencyLog: fakeLog)
+                              latencyLog: fakeLog, traceLog: fakeTrace)
         engine.fastFrames = .max   // fast path off for the dwell tests; enabled explicitly below
     }
 
@@ -430,4 +437,45 @@ final class EngineTests: XCTestCase {
     }
 
     func testTypingPauseDefault() { XCTAssertEqual(Settings().typingPauseSec, 0.5) }
+
+    // MARK: trace
+
+    func testTraceRowPerFrameWithExpectedColumns() {
+        input.lastKeyTime = clock
+        gaze(2, CGPoint(x: 1050, y: 400), for: 0.2)
+        XCTAssertGreaterThan(fakeTrace.rows.count, 2)
+        let cols = fakeTrace.rows.last!.split(separator: ",", omittingEmptySubsequences: false)
+        XCTAssertEqual(cols.count, TraceLog.header.split(separator: ",").count)
+        XCTAssertEqual(cols[10], "1050.0"); XCTAssertEqual(cols[12], "2")
+        XCTAssertEqual(cols[13], "1")           // currentDisplay (from focus)
+        XCTAssertEqual(cols[14], "typing"); XCTAssertEqual(cols[15], "2")
+        XCTAssertTrue(fakeTrace.rows.allSatisfy { $0.allSatisfy { "0123456789.,-typingmouse".contains($0) } })
+    }
+
+    func testTraceNoFaceRowHasEmptyPoseColumns() {
+        noFace(for: 0.1)
+        let cols = fakeTrace.rows[0].split(separator: ",", omittingEmptySubsequences: false)
+        XCTAssertEqual(cols.count, 16)
+        XCTAssertTrue(cols[1...12].allSatisfy { $0.isEmpty })
+    }
+
+    func testTraceDisabledWritesNothing() {
+        fakeTrace.isEnabled = false
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.3)
+        XCTAssertTrue(fakeTrace.rows.isEmpty)
+    }
+
+    func testTraceFileRotates() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("glance-trace-\(UUID().uuidString)")
+        let suite = UserDefaults(suiteName: "glance.test.\(UUID().uuidString)")!
+        suite.set(true, forKey: TraceLog.defaultsKey)
+        let url = dir.appendingPathComponent("trace.csv")
+        let log = TraceLog(defaults: suite, url: url, maxBytes: 2_000)
+        for i in 0..<200 { log.write("\(i),1,2,3,4,5,6,7,8,9,10,11,12,13,,") }
+        log.sync()
+        let rotated = dir.appendingPathComponent("trace.1.csv")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: rotated.path))
+        XCTAssertTrue(try String(contentsOf: rotated).hasPrefix(TraceLog.header))
+        XCTAssertLessThan(try Data(contentsOf: url).count, 4_000)
+    }
 }

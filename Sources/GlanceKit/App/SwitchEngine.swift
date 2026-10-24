@@ -21,6 +21,7 @@ public final class SwitchEngine {
     private let displayAt: (CGPoint) -> DisplayID?
     private let schedule: (TimeInterval, @escaping () -> Void) -> Void
     private let latencyLog: LatencyLogging?
+    private let traceLog: TraceLogging?
 
     public private(set) var currentDisplay: DisplayID?
     public private(set) var state: State
@@ -86,8 +87,10 @@ public final class SwitchEngine {
                 schedule: @escaping (TimeInterval, @escaping () -> Void) -> Void = { delay, block in
                     DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: block)
                 },
-                latencyLog: LatencyLogging? = LatencyLog()) {
+                latencyLog: LatencyLogging? = LatencyLog(),
+                traceLog: TraceLogging? = TraceLog()) {
         self.latencyLog = latencyLog
+        self.traceLog = traceLog
         self.mapper = mapper; self.focus = focus; self.input = input
         self.settings = settings; self.now = now
         self.displayFrame = displayFrame; self.displayAt = displayAt; self.schedule = schedule
@@ -106,6 +109,12 @@ public final class SwitchEngine {
     // MARK: Pose handling
 
     public func handle(pose: HeadPose?) {
+        let t0 = now()
+        process(pose)
+        traceFrame(pose, t: t0)
+    }
+
+    private func process(_ pose: HeadPose?) {
         let s = settings()
         guard !s.paused else {
             clearCandidate("paused"); paneCandidate = nil; steadyAnchor = nil
@@ -211,6 +220,28 @@ public final class SwitchEngine {
     }
 
     // MARK: Diagnostics
+
+    /// One CSV row per frame (numbers only) so real misses can be replayed against another mapper.
+    private func traceFrame(_ pose: HeadPose?, t: TimeInterval) {
+        guard let trace = traceLog, trace.isEnabled else { return }
+        func f(_ x: Double, _ digits: Int = 4) -> String { String(format: "%.\(digits)f", x) }
+        var cols = [String(format: "%.3f", pose?.timestamp ?? t)]
+        if let p = pose {
+            cols += [f(p.yaw), f(p.pitch), f(p.roll), f(Double(p.faceCenter.x)), f(Double(p.faceCenter.y)),
+                     f(p.faceSize), f(Double(p.eyeOffset.dx)), f(Double(p.eyeOffset.dy)), f(p.confidence, 3)]
+        } else {
+            cols += Array(repeating: "", count: 9)
+        }
+        if let e = state.estimate {
+            cols += [f(Double(e.point.x), 1), f(Double(e.point.y), 1), e.displayID.map { String($0) } ?? ""]
+        } else {
+            cols += ["", "", ""]
+        }
+        cols.append(currentDisplay.map { String($0) } ?? "")
+        cols.append(state.hold.map { $0 == .typing ? "typing" : "mouse" } ?? "")
+        cols.append(candidateDisplay.map { String($0) } ?? "")
+        trace.write(cols.joined(separator: ","))
+    }
 
     private func recordFrame(_ t: TimeInterval, hasFace: Bool) {
         guard let log = latencyLog, log.isEnabled else { return }
