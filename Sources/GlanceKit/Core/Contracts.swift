@@ -145,13 +145,13 @@ public protocol InputActivityMonitoring: AnyObject {
 // MARK: - Settings
 
 public struct Settings: Codable, Equatable {
-    public var switchDelayMs: Double = 300        // dwell before switching displays
+    public var switchDelayMs: Double = 150        // dwell before switching displays
     public var headTurnThreshold: Double = 0.5    // edgeBias passed to the mapper
     public var windowFocusEnabled: Bool = true    // windows / panes on the same display
     public var paneDelayMs: Double = 300
     public var typingProtection: Bool = true
-    public var typingPauseSec: Double = 2.0
-    public var mousePriorityMs: Double = 1500
+    public var typingPauseSec: Double = 0.8
+    public var mousePriorityMs: Double = 600
     public var movePointer: Bool = true
     public var showGazeDot: Bool = false
     public var cameraID: String? = nil

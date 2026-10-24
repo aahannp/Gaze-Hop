@@ -63,6 +63,26 @@ public final class InputMonitor: InputActivityMonitoring {
         thread = nil; tap = nil; runLoop = nil; running = false
     }
 
+    // Pointer-travel filter (guarded by `lock`): a brush of the trackpad (< ~3 px in 100 ms)
+    // is not mouse activity, and neither is a jump our own CGWarpMouseCursorPosition causes
+    // (the location moves much more than the event's reported delta).
+    private var lastMoveLocation: CGPoint?
+    private var travelWindowStart: TimeInterval = 0
+    private var travelInWindow: Double = 0
+    static let minTravelPx = 3.0
+    static let travelWindow: TimeInterval = 0.1
+
+    private func isRealPointerTravel(_ event: CGEvent, now: TimeInterval) -> Bool {
+        let loc = event.location
+        let dx = event.getDoubleValueField(.mouseEventDeltaX), dy = event.getDoubleValueField(.mouseEventDeltaY)
+        let reported = hypot(dx, dy)
+        defer { lastMoveLocation = loc }
+        if let last = lastMoveLocation, hypot(loc.x - last.x, loc.y - last.y) > reported + 40 { return false } // warp jump
+        if now - travelWindowStart > Self.travelWindow { travelWindowStart = now; travelInWindow = 0 }
+        travelInWindow += reported
+        return travelInWindow >= Self.minTravelPx
+    }
+
     fileprivate func handle(_ type: CGEventType, _ event: CGEvent) {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let tap = tap { CGEvent.tapEnable(tap: tap, enable: true) }
@@ -72,7 +92,10 @@ public final class InputMonitor: InputActivityMonitoring {
         let now = ProcessInfo.processInfo.systemUptime
         lock.lock()
         switch type {
-        case .keyDown, .flagsChanged: _lastKey = now
+        case .keyDown: _lastKey = now
+        case .flagsChanged: break   // pressing ⌘/⇧/⌃/⌥ alone is not typing
+        case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+            if isRealPointerTravel(event, now: now) { _lastMouse = now }
         default: _lastMouse = now
         }
         lock.unlock()
