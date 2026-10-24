@@ -4,149 +4,6 @@
 import AppKit
 import QuartzCore
 
-// MARK: - Overlay views
-
-private final class OverlayWindow: NSWindow {
-    var onEscape: (() -> Void)?
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { onEscape?() } else { super.keyDown(with: event) }
-    }
-    override func cancelOperation(_ sender: Any?) { onEscape?() }
-}
-
-private final class ActionButton: NSButton {
-    var handler: (() -> Void)?
-    convenience init(title: String, handler: @escaping () -> Void) {
-        self.init(frame: .zero)
-        self.title = title
-        self.handler = handler
-        bezelStyle = .rounded
-        controlSize = .large
-        font = .systemFont(ofSize: 17, weight: .semibold)
-        target = self
-        action = #selector(fire)
-        isHidden = true
-    }
-    @objc private func fire() { handler?() }
-}
-
-private final class OverlayView: NSView {
-    let dot = CAShapeLayer()
-    let ring = CAShapeLayer()
-    let header = NSTextField(labelWithString: "")
-    let face = NSTextField(labelWithString: "")
-    let big = NSTextField(labelWithString: "")
-    let title = NSTextField(labelWithString: "")
-    let subtitle = NSTextField(labelWithString: "")
-    let primary: ActionButton
-    let secondary: ActionButton
-    override var isFlipped: Bool { true }   // local coords == CG offsets from the display origin
-
-    init(frame: NSRect, primary: ActionButton, secondary: ActionButton) {
-        self.primary = primary; self.secondary = secondary
-        super.init(frame: frame)
-        wantsLayer = true
-        layer?.backgroundColor = NSColor(calibratedWhite: 0.04, alpha: 0.82).cgColor
-        layer?.borderColor = NSColor.clear.cgColor
-
-        let r: CGFloat = 13
-        dot.path = CGPath(ellipseIn: CGRect(x: -r, y: -r, width: 2 * r, height: 2 * r), transform: nil)
-        dot.fillColor = NSColor.systemOrange.cgColor
-        dot.strokeColor = NSColor.white.cgColor
-        dot.lineWidth = 2
-        dot.opacity = 0
-        let rr: CGFloat = 30
-        ring.path = CGPath(ellipseIn: CGRect(x: -rr, y: -rr, width: 2 * rr, height: 2 * rr), transform: nil)
-        ring.fillColor = nil
-        ring.strokeColor = NSColor.systemOrange.withAlphaComponent(0.6).cgColor
-        ring.lineWidth = 2
-        ring.opacity = 0
-        layer?.addSublayer(ring)
-        layer?.addSublayer(dot)
-
-        let specs: [(NSTextField, CGFloat, NSFont.Weight, CGFloat)] = [
-            (header, 15, .medium, 0.55), (face, 15, .medium, 0.9), (big, 84, .bold, 0.95),
-            (title, 28, .semibold, 1), (subtitle, 16, .regular, 0.65),
-        ]
-        for (f, size, weight, alpha) in specs {
-            f.font = f === big ? .monospacedDigitSystemFont(ofSize: size, weight: weight) : .systemFont(ofSize: size, weight: weight)
-            f.textColor = NSColor.white.withAlphaComponent(alpha)
-            f.alignment = .center
-            f.lineBreakMode = .byTruncatingTail
-            addSubview(f)
-        }
-        header.alignment = .left
-        face.alignment = .right
-        addSubview(primary); addSubview(secondary)
-        ring.add(pulse(), forKey: "pulse")
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    private func pulse() -> CAAnimationGroup {
-        let s = CABasicAnimation(keyPath: "transform.scale"); s.fromValue = 0.55; s.toValue = 1.0
-        let o = CABasicAnimation(keyPath: "opacity"); o.fromValue = 1.0; o.toValue = 0.0
-        let g = CAAnimationGroup(); g.animations = [s, o]; g.duration = 1.1; g.repeatCount = .infinity
-        g.timingFunction = CAMediaTimingFunction(name: .easeOut)
-        return g
-    }
-
-    override func layout() {
-        super.layout()
-        let w = bounds.width, h = bounds.height
-        header.frame = CGRect(x: 40, y: 30, width: w / 2 - 40, height: 22)
-        face.frame = CGRect(x: w / 2, y: 30, width: w / 2 - 40, height: 22)
-        big.frame = CGRect(x: 40, y: h * 0.5 - 190, width: w - 80, height: 110)
-        title.frame = CGRect(x: 40, y: h * 0.5 + 60, width: w - 80, height: 36)
-        subtitle.frame = CGRect(x: 40, y: title.frame.maxY + 6, width: w - 80, height: 22)
-        let bw: CGFloat = 150, bh: CGFloat = 36, y = subtitle.frame.maxY + 28
-        let both = !primary.isHidden && !secondary.isHidden
-        primary.frame = CGRect(x: w / 2 - (both ? bw + 8 : bw / 2), y: y, width: bw, height: bh)
-        secondary.frame = CGRect(x: w / 2 + (both ? 8 : -bw / 2), y: y, width: bw, height: bh)
-    }
-
-    func setButtons(primary p: String?, secondary s: String?) {
-        primary.isHidden = p == nil; secondary.isHidden = s == nil
-        if let p { primary.title = p }
-        if let s { secondary.title = s }
-        needsLayout = true
-    }
-
-    func setFace(_ visible: Bool) {
-        face.stringValue = visible ? "●  Face detected" : "●  No face detected"
-        face.textColor = (visible ? NSColor.systemGreen : NSColor.systemRed).withAlphaComponent(0.95)
-    }
-
-    func highlight(_ color: NSColor?) {
-        layer?.borderWidth = color == nil ? 0 : 10
-        layer?.borderColor = color?.cgColor ?? NSColor.clear.cgColor
-    }
-
-    func showDot(at p: CGPoint, animated: Bool, fromHidden: Bool) {
-        CATransaction.begin()
-        CATransaction.setDisableActions(!animated)
-        CATransaction.setAnimationDuration(0.55)
-        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeInEaseOut))
-        dot.position = p; ring.position = p
-        CATransaction.commit()
-        if fromHidden {
-            let pop = CABasicAnimation(keyPath: "transform.scale"); pop.fromValue = 0.1; pop.toValue = 1
-            pop.duration = 0.35; pop.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            dot.add(pop, forKey: "pop")
-        }
-        CATransaction.begin(); CATransaction.setDisableActions(true)
-        dot.opacity = 1; ring.opacity = 1
-        CATransaction.commit()
-    }
-
-    func hideDot() {
-        CATransaction.begin(); CATransaction.setDisableActions(true)
-        dot.opacity = 0; ring.opacity = 0
-        CATransaction.commit()
-    }
-}
-
 // MARK: - Controller
 
 public final class CalibrationController: Calibrating {
@@ -178,7 +35,7 @@ public final class CalibrationController: Calibrating {
     /// Demo only: start and finish without waiting for the user.
     var autoAdvance = false
 
-    private var windows: [DisplayID: OverlayWindow] = [:]
+    private var windows: [DisplayID: CalibrationOverlayWindow] = [:]
     private var plans: [Plan] = []
     private var steps: [Step] = []
     private var stepIndex = 0
@@ -322,7 +179,7 @@ public final class CalibrationController: Calibrating {
     private func buildWindows() {
         for screen in NSScreen.screens {
             guard let id = Displays.displayID(of: screen) else { continue }
-            let w = OverlayWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+            let w = CalibrationOverlayWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
             w.setFrame(screen.frame, display: false)
             w.level = .screenSaver
             w.isOpaque = false
@@ -331,13 +188,18 @@ public final class CalibrationController: Calibrating {
             w.isReleasedWhenClosed = false
             w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
             w.onEscape = { [weak self] in self?.cancel() }
-            let primary = ActionButton(title: "") { [weak self] in self?.primaryAction(on: id) }
-            let secondary = ActionButton(title: "") { [weak self] in self?.secondaryAction(on: id) }
-            let v = OverlayView(frame: CGRect(origin: .zero, size: screen.frame.size), primary: primary, secondary: secondary)
-            v.header.stringValue = displayName(id)
+            let primary = ActionButton(title: "", primary: true) { [weak self] in self?.primaryAction(on: id) }
+            let secondary = ActionButton(title: "", primary: false) { [weak self] in self?.secondaryAction(on: id) }
+            let v = CalibrationOverlayView(frame: CGRect(origin: .zero, size: screen.frame.size), primary: primary, secondary: secondary)
+            v.setHeader(displayName(id))
             v.setFace(hub?.latest.map { $0.confidence >= minPoseConfidence } ?? false)
             w.contentView = v
+            w.alphaValue = 0
             w.orderFrontRegardless()
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.3
+                w.animator().alphaValue = 1
+            }
             windows[id] = w
         }
         windows[plans.first?.display.id ?? 0]?.makeKey()
@@ -352,24 +214,31 @@ public final class CalibrationController: Calibrating {
 
     private func screenNumber(_ id: DisplayID) -> Int { (plans.firstIndex { $0.display.id == id } ?? 0) + 1 }
 
-    private func view(_ id: DisplayID) -> OverlayView? { windows[id]?.contentView as? OverlayView }
-    private var views: [(DisplayID, OverlayView)] { windows.compactMap { id, w in (w.contentView as? OverlayView).map { (id, $0) } } }
+    private func view(_ id: DisplayID) -> CalibrationOverlayView? { windows[id]?.contentView as? CalibrationOverlayView }
+    private var views: [(DisplayID, CalibrationOverlayView)] { windows.compactMap { id, w in (w.contentView as? CalibrationOverlayView).map { (id, $0) } } }
 
     /// `active` gets the main text; every other display gets `other` (default: a pointer to the active screen).
-    private func setText(title: String, subtitle: String, big: String = "", active: DisplayID?, other: String? = nil,
-                         titleColor: NSColor = .white) {
+    private func setText(title: String, subtitle: String = "", big: String = "", active: DisplayID?, other: String? = nil,
+                         titleColor: NSColor = .white, layout: CalibrationOverlayView.Layout = .compact, pill: Bool = false,
+                         hint: String = CalibrationCopy.hint) {
         for (id, v) in views {
             let isActive = active == nil || id == active
-            v.title.stringValue = isActive ? title : (other ?? "Look at the dot on Screen \(screenNumber(active!))")
-            v.title.textColor = isActive ? titleColor : NSColor.white.withAlphaComponent(0.7)
-            v.subtitle.stringValue = subtitle
-            v.big.stringValue = isActive ? big : ""
+            var c = CalibrationOverlayView.Content()
+            c.title = isActive ? title : (other ?? CalibrationCopy.elsewhere(screen: screenNumber(active!)))
+            c.titleColor = isActive ? titleColor : NSColor.white.withAlphaComponent(0.7)
+            c.subtitle = isActive ? subtitle : ""
+            c.big = isActive ? big : ""
+            c.layout = isActive ? layout : .message
+            c.pill = isActive && pill
+            c.hint = hint
+            v.apply(c)
         }
     }
 
     private func clearButtons() { for (_, v) in views { v.setButtons(primary: nil, secondary: nil) } }
     private func clearHighlights() { for (_, v) in views { v.highlight(nil) } }
     private func hideDots() { for (_, v) in views { v.hideDot() } }
+    private func clearBadges() { for (_, v) in views { v.setBadge(nil) } }
 
     // MARK: Input
 
@@ -430,13 +299,16 @@ public final class CalibrationController: Calibrating {
         phase = .intro
         currentTarget = nil
         hideDots(); clearHighlights()
-        let n = plans.count
-        let sub = n > 1 ? "We'll calibrate all \(n) screens, one at a time." : "We'll calibrate your screen."
-        for (_, v) in views {
-            v.title.stringValue = "Sit how you normally work"
-            v.title.textColor = .white
-            v.subtitle.stringValue = sub + "  Space or click Start  ·  Esc to cancel"
-            v.big.stringValue = ""
+        clearBadges()
+        for (id, v) in views {
+            var c = CalibrationOverlayView.Content()
+            c.title = CalibrationCopy.introTitle
+            c.subtitle = CalibrationCopy.introSubtitle(screens: plans.count)
+            c.hint = CalibrationCopy.introHint
+            c.layout = .message
+            v.apply(c)
+            v.setHeader(displayName(id))
+            v.setProgress(nil)
             v.setButtons(primary: "Start", secondary: nil)
         }
         if autoAdvance { after(2.5) { [weak self] in self?.startCalibration() } }
@@ -454,8 +326,15 @@ public final class CalibrationController: Calibrating {
 
     // MARK: 2+3. Head range and dot sequence
 
+    /// "Display 1 of 2 · 7/18": position of the current step among the steps shown on its display.
     private func progressText() -> String {
-        "Step \(stepIndex + 1) of \(steps.count)  ·  Esc to cancel"
+        let id = steps[stepIndex].display.id
+        var k = 0, total = 0
+        for (i, s) in steps.enumerated() where s.display.id == id {
+            total += 1
+            if i <= stepIndex { k += 1 }
+        }
+        return plans.count > 1 ? "Display \(screenNumber(id)) of \(plans.count)  ·  \(k)/\(total)" : "Step \(k) of \(total)"
     }
 
     private func beginStep(first: Bool = false, retry: Bool = false) {
@@ -470,23 +349,22 @@ public final class CalibrationController: Calibrating {
         switch step.kind {
         case .range(let label, let arrow):
             settle = rangeSettleTime
-            let name = label == "CENTER" ? "Look at the CENTER of this screen" : "Look at the \(label.uppercased()) of this screen"
-            setText(title: name, subtitle: progressText(), big: "\(arrow)  3", active: id, other: "Look at Screen \(screenNumber(id))")
+            setText(title: CalibrationCopy.range(label), big: "\(arrow)  3", active: id,
+                    other: CalibrationCopy.elsewhere(screen: screenNumber(id)), layout: .range)
             // 3-2-1 countdown
             for k in 1..<3 {
                 after(settle * Double(k) / 3) { [weak self] in
                     guard let self else { return }
-                    self.view(id)?.big.stringValue = "\(arrow)  \(3 - k)"
+                    self.view(id)?.setBig("\(arrow)  \(3 - k)")
                 }
             }
         case .dot:
             settle = settleTime
-            setText(title: "Follow the dot with your eyes and head", subtitle: progressText(), active: id)
+            setText(title: CalibrationCopy.dot, active: id)
         case .eyeDot:
             settle = settleTime
             let firstEye = stepIndex == 0 || steps[stepIndex - 1].kind != .eyeDot
-            setText(title: "Keep your head still, follow the dot with your eyes only", subtitle: progressText(),
-                    big: "HEAD STILL", active: id)
+            setText(title: CalibrationCopy.eyes, active: id, pill: true)
             if firstEye { settle += eyePhaseExtraDelay }
         }
         currentEyesOnly = step.kind == .eyeDot
@@ -494,10 +372,15 @@ public final class CalibrationController: Calibrating {
         if retry { settle += 0.3 }
 
         let f = step.display.frame
+        let header = progressText()
+        let fraction = Double(stepIndex) / Double(steps.count)
         for (vid, v) in views {
+            v.setHeader(header)
+            v.setProgress(fraction)
             if vid == id {
                 let local = CGPoint(x: step.target.x - f.minX, y: step.target.y - f.minY)
-                v.showDot(at: local, animated: !newDisplay && !retry, fromHidden: newDisplay || first)
+                v.showDot(at: local, animated: !newDisplay && !retry, fromHidden: newDisplay || first,
+                          eyesOnly: step.kind == .eyeDot)
             } else {
                 v.hideDot()
             }
@@ -509,6 +392,7 @@ public final class CalibrationController: Calibrating {
     private func startCollecting() {
         collected = []
         isCollecting = true
+        if stepIndex < steps.count { view(steps[stepIndex].display.id)?.startArc(duration: collectTime) }
         after(collectTime) { [weak self] in self?.endCollecting() }
     }
 
@@ -517,8 +401,9 @@ public final class CalibrationController: Calibrating {
         guard let mapper else { return }
         let step = steps[stepIndex]
         guard collected.count >= minPoses, let avg = Self.average(collected) else {
-            setText(title: "Can't see your face", subtitle: "Move into view of the camera — retrying…", active: step.display.id,
-                    other: "Can't see your face", titleColor: .systemRed)
+            setText(title: CalibrationCopy.noFace, subtitle: CalibrationCopy.noFaceSub, active: step.display.id,
+                    other: CalibrationCopy.noFace, titleColor: CalibrationPalette.bad,
+                    layout: { if case .range = step.kind { return .range } else { return .compact } }(), pill: step.kind == .eyeDot)
             after(1.2) { [weak self] in self?.beginStep(retry: true) }
             return
         }
@@ -528,8 +413,8 @@ public final class CalibrationController: Calibrating {
                 let v = collected.map(k); return (v.max() ?? 0) - (v.min() ?? 0)
             }
             if spread({ $0.yaw }) > maxHeadSpread || spread({ $0.pitch }) > maxHeadSpread {
-                setText(title: "Hold your head still", subtitle: "Move only your eyes — retrying…", big: "HEAD STILL",
-                        active: step.display.id, other: "Hold your head still", titleColor: .systemOrange)
+                setText(title: CalibrationCopy.holdStill, subtitle: CalibrationCopy.holdStillSub,
+                        active: step.display.id, other: CalibrationCopy.holdStill, titleColor: CalibrationPalette.warn, pill: true)
                 after(1.2) { [weak self] in self?.beginStep(retry: true) }
                 return
             }
@@ -539,6 +424,7 @@ public final class CalibrationController: Calibrating {
         } else {
             mapper.addSample(avg, target: step.target, weight: 1.0)
         }
+        view(step.display.id)?.pop()
         stepIndex += 1
         if stepIndex >= steps.count { fitAndVerify() } else { beginStep() }
     }
@@ -564,10 +450,12 @@ public final class CalibrationController: Calibrating {
         currentTarget = CGPoint(x: d.frame.midX, y: d.frame.midY)
         isCollecting = false
         verifyHits = []
-        hideDots(); clearHighlights()
-        let n = plans.count
-        setText(title: "Look at this screen", subtitle: "Verifying  \(verifyIndex + 1) of \(n)  ·  Esc to cancel",
-                big: "", active: d.id, other: "Look at Screen \(screenNumber(d.id))")
+        hideDots(); clearHighlights(); clearBadges()
+        setText(title: CalibrationCopy.verify, active: d.id, other: CalibrationCopy.elsewhere(screen: screenNumber(d.id)))
+        for (_, v) in views {
+            v.setHeader(CalibrationCopy.verifyHeader(verifyIndex + 1, of: plans.count))
+            v.setProgress(1)
+        }
         windows[d.id]?.makeKey()
         after(verifySettle + (retry ? 0.3 : 0)) { [weak self] in
             guard let self else { return }
@@ -581,19 +469,17 @@ public final class CalibrationController: Calibrating {
         isCollecting = false
         let d = plans[verifyIndex].display
         guard verifyHits.count >= minPoses else {
-            setText(title: "Can't see your face", subtitle: "Move into view of the camera — retrying…", active: d.id,
-                    other: "Can't see your face", titleColor: .systemRed)
+            setText(title: CalibrationCopy.noFace, subtitle: CalibrationCopy.noFaceSub, active: d.id,
+                    other: CalibrationCopy.noFace, titleColor: CalibrationPalette.bad)
             after(1.2) { [weak self] in self?.beginVerify(retry: true) }
             return
         }
         let hits = verifyHits.filter { $0 == d.id }.count
         let pass = Double(hits) / Double(verifyHits.count) >= verifyPassFraction
         verifyResults[d.id] = pass
-        view(d.id)?.big.stringValue = pass ? "✓" : "✗"
-        view(d.id)?.big.textColor = (pass ? NSColor.systemGreen : NSColor.systemRed)
+        view(d.id)?.setBadge(pass)
         after(0.9) { [weak self] in
             guard let self else { return }
-            self.view(d.id)?.big.textColor = NSColor.white.withAlphaComponent(0.95)
             self.verifyIndex += 1
             if self.verifyIndex >= self.plans.count { self.showSummary() } else { self.beginVerify() }
         }
@@ -606,13 +492,23 @@ public final class CalibrationController: Calibrating {
         let failed = plans.map { $0.display.id }.filter { verifyResults[$0] != true }
         for (id, v) in views {
             let ok = verifyResults[id] == true
-            v.big.stringValue = ok ? "✓" : "✗"
-            v.big.textColor = (ok ? NSColor.systemGreen : NSColor.systemRed)
-            v.title.stringValue = ok ? "\(plans.count > 1 ? "Screen \(screenNumber(id))" : "Screen") detected correctly"
-                                     : "Couldn't detect \(plans.count > 1 ? "Screen \(screenNumber(id))" : "this screen") reliably"
-            v.title.textColor = .white
-            v.subtitle.stringValue = failed.isEmpty ? "All set.  Return or click Finish"
-                                                    : "Return to finish anyway  ·  R to redo the failing screen\(failed.count > 1 ? "s" : "")"
+            let name = plans.count > 1 ? "Screen \(screenNumber(id))" : "this screen"
+            var c = CalibrationOverlayView.Content()
+            if failed.isEmpty {
+                c.title = CalibrationCopy.allSetTitle
+                c.subtitle = CalibrationCopy.allSetSubtitle(screens: plans.count)
+                c.hint = CalibrationCopy.allSetHint
+            } else {
+                c.title = ok ? CalibrationCopy.screenOK(name.prefix(1).uppercased() + name.dropFirst())
+                             : CalibrationCopy.screenFailed(name)
+                c.subtitle = ok ? "" : CalibrationCopy.failedSubtitle
+                c.hint = CalibrationCopy.failedHint
+            }
+            c.layout = .message
+            v.apply(c)
+            v.setHeader(displayName(id))
+            v.setProgress(nil)
+            v.setBadge(ok)
             v.setButtons(primary: "Finish", secondary: ok || failed.isEmpty ? nil : "Redo")
         }
         if autoAdvance { after(3) { [weak self] in self?.finishSuccess() } }
@@ -623,7 +519,7 @@ public final class CalibrationController: Calibrating {
         guard phase == .summary, !failed.isEmpty else { return }
         steps = Self.allSteps(for: plans.filter { failed.contains($0.display.id) })
         stepIndex = 0
-        for (_, v) in views { v.big.textColor = NSColor.white.withAlphaComponent(0.95) }
+        clearBadges()
         clearButtons()
         phase = .steps
         beginStep(first: true)
