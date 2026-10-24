@@ -20,7 +20,7 @@ struct SettingsView: View {
                        hint: "Lower switches sooner when you turn; higher needs a bigger turn.")
                 Toggle("Move pointer to the new display", isOn: s.movePointer)
                 Toggle("Mouse priority", isOn: Binding(get: { s.wrappedValue.mousePriorityMs > 0 },
-                                                       set: { s.wrappedValue.mousePriorityMs = $0 ? 1500 : 0 }))
+                                                       set: { s.wrappedValue.mousePriorityMs = $0 ? 600 : 0 }))
                 if store.settings.mousePriorityMs > 0 {
                     slider("Mouse priority window", s.mousePriorityMs, 250...5000, step: 250, unit: "ms")
                 }

@@ -44,6 +44,14 @@ private func isAncestorOrSelf(_ ancestor: AXUIElement, of e: AXUIElement) -> Boo
     return false
 }
 
+private let axTimeout: Float = 0.12
+
+private func axApp(_ pid: pid_t) -> AXUIElement {
+    let a = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(a, axTimeout)
+    return a
+}
+
 // MARK: - Controller
 
 public final class AXFocusController: FocusController {
@@ -54,6 +62,9 @@ public final class AXFocusController: FocusController {
     private var observedPID: pid_t = 0
     private var observedApp: AXUIElement?
     private var tracking = false
+    private var focusedDisplayCache: (display: DisplayID?, at: TimeInterval)?
+    private static let focusedDisplayTTL: TimeInterval = 0.4   // safety net for windows dragged between displays
+    public private(set) var lastTargetPID: pid_t = 0
     private let myPID = ProcessInfo.processInfo.processIdentifier
 
     public init() {}
@@ -75,6 +86,7 @@ public final class AXFocusController: FocusController {
     }
 
     @objc private func appActivated(_ n: Notification) {
+        focusedDisplayCache = nil
         guard let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
         recordFocusedWindow(pid: app.processIdentifier)
         attachObserver(pid: app.processIdentifier)
@@ -88,6 +100,7 @@ public final class AXFocusController: FocusController {
         let cb: AXObserverCallback = { _, element, _, refcon in
             guard let refcon = refcon else { return }
             let me = Unmanaged<AXFocusController>.fromOpaque(refcon).takeUnretainedValue()
+            me.focusedDisplayCache = nil
             if let pid = axPID(element) { me.recordFocusedWindow(pid: pid) }
         }
         guard AXObserverCreate(pid, cb, &obs) == .success, let o = obs else { return }
@@ -108,8 +121,7 @@ public final class AXFocusController: FocusController {
 
     private func recordFocusedWindow(pid: pid_t) {
         guard pid != myPID else { return }
-        let app = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(app, 0.5)
+        let app = axApp(pid)
         guard let win = axElement(app, kAXFocusedWindowAttribute) ?? axElement(app, kAXMainWindowAttribute),
               let id = axWindowID(win), !axBool(win, kAXMinimizedAttribute) else { return }
         if let sub = axString(win, kAXSubroleAttribute), sub != "AXStandardWindow", sub != "AXDialog" { return }
@@ -146,8 +158,7 @@ public final class AXFocusController: FocusController {
 
     private func axWindow(for w: WindowSnapshot) -> AXUIElement? {
         if let e = history.first(where: { $0.windowID == w.id }) { return e.element }
-        let app = AXUIElementCreateApplication(w.pid)
-        AXUIElementSetMessagingTimeout(app, 0.5)
+        let app = axApp(w.pid)
         guard let wins = axAttr(app, kAXWindowsAttribute) as? [AXUIElement] else { return nil }
         return wins.first { axWindowID($0) == w.id }
     }
@@ -156,21 +167,34 @@ public final class AXFocusController: FocusController {
 
     @discardableResult
     public func focusDisplay(_ display: DisplayID, gazePoint: CGPoint?, movePointer: Bool) -> Bool {
-        prune()
-        let wins = windowList()
+        let wins = windowList()   // on-screen only, so closed/minimized windows never show up
         let displays = Displays.all()
         guard let info = displays.first(where: { $0.id == display }) else { return false }
 
+        // Candidates in preference order; the first one we can resolve to an AX window wins.
+        var candidates: [WindowSnapshot] = []
+        if let g = gazePoint, info.frame.contains(g),
+           let w = FocusLogic.windowUnder(g, in: wins, excludingPID: myPID) { candidates.append(w) }
         var target: WindowSnapshot?
-        if let g = gazePoint, info.frame.contains(g) {
-            target = FocusLogic.windowUnder(g, in: wins, excludingPID: myPID)
+        var win: AXUIElement?
+        var mruHistory = history.map { $0.windowID }
+        func tryResolve(_ w: WindowSnapshot) -> Bool {
+            if let e = axWindow(for: w) { target = w; win = e; return true }
+            history.removeAll { $0.windowID == w.id }     // dead: drop lazily
+            return false
+        }
+        for w in candidates where tryResolve(w) { break }
+        while target == nil,
+              let w = FocusLogic.mruWindow(on: display, history: mruHistory, windows: wins,
+                                           displays: displays, excludingPID: myPID) {
+            if !tryResolve(w) { mruHistory.removeAll { $0 == w.id } }
         }
         if target == nil {
-            target = FocusLogic.mruWindow(on: display, history: history.map { $0.windowID }, windows: wins,
-                                          displays: displays, excludingPID: myPID)
-        }
-        if target == nil {
-            target = FocusLogic.topWindow(on: display, in: wins, displays: displays, excludingPID: myPID)
+            var rest = wins
+            while target == nil,
+                  let w = FocusLogic.topWindow(on: display, in: rest, displays: displays, excludingPID: myPID) {
+                if !tryResolve(w) { rest.removeAll { $0.id == w.id } }
+            }
         }
 
         if movePointer {
@@ -180,8 +204,8 @@ public final class AXFocusController: FocusController {
             else { p = CGPoint(x: info.frame.midX, y: info.frame.midY) }
             warpPointer(to: clamp(p, to: info.frame))
         }
-        guard let t = target else { return false }
-        return activate(t)
+        guard let t = target, let win = win else { return false }
+        return activate(t, window: win)
     }
 
     private func clamp(_ p: CGPoint, to r: CGRect) -> CGPoint {
@@ -194,18 +218,33 @@ public final class AXFocusController: FocusController {
     }
 
     /// Activate the app and raise the specific window — no synthetic click.
+    /// AX first (synchronous, works from a background app), NSRunningApplication last as a nudge.
     @discardableResult
-    private func activate(_ w: WindowSnapshot) -> Bool {
-        guard let win = axWindow(for: w) else { return false }
-        let appEl = AXUIElementCreateApplication(w.pid)
-        AXUIElementSetMessagingTimeout(appEl, 0.5)
-        NSRunningApplication(processIdentifier: w.pid)?.activate()
+    private func activate(_ w: WindowSnapshot, window win: AXUIElement? = nil) -> Bool {
+        lastTargetPID = w.pid
+        guard let win = win ?? axWindow(for: w) else { return false }
+        let appEl = axApp(w.pid)
         AXUIElementSetAttributeValue(appEl, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
         AXUIElementSetAttributeValue(win, kAXMainAttribute as CFString, kCFBooleanTrue)
         AXUIElementSetAttributeValue(appEl, kAXFocusedWindowAttribute as CFString, win)
         let r = AXUIElementPerformAction(win, kAXRaiseAction as CFString)
-        recordFocusedWindow(pid: w.pid)
+        // AXFrontmost alone is the fastest path (measured: NSRunningApplication.activate() first or
+        // last added ~20 ms). Keep it only as a delayed fallback for apps that ignore AXFrontmost.
+        let pid = w.pid
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier != pid {
+                NSRunningApplication(processIdentifier: pid)?.activate()
+            }
+        }
+        focusedDisplayCache = nil
+        touchHistory(pid: w.pid, window: win, id: w.id)
         return r == .success
+    }
+
+    private func touchHistory(pid: pid_t, window: AXUIElement, id: UInt32) {
+        history.removeAll { $0.windowID == id }
+        history.insert(Entry(pid: pid, element: window, windowID: id), at: 0)
+        if history.count > 64 { history.removeLast(history.count - 64) }
     }
 
     @discardableResult
@@ -215,7 +254,7 @@ public final class AXFocusController: FocusController {
 
         let front = NSWorkspace.shared.frontmostApplication
         let focusedWinID = front.flatMap { app -> UInt32? in
-            let a = AXUIElementCreateApplication(app.processIdentifier)
+            let a = axApp(app.processIdentifier)
             return axElement(a, kAXFocusedWindowAttribute).flatMap(axWindowID)
         }
         if front?.processIdentifier != under.pid || focusedWinID != under.id {
@@ -226,8 +265,7 @@ public final class AXFocusController: FocusController {
     }
 
     private func focusPane(pid: pid_t, at point: CGPoint, clickFallback: Bool) -> Bool {
-        let appEl = AXUIElementCreateApplication(pid)
-        AXUIElementSetMessagingTimeout(appEl, 0.5)
+        let appEl = axApp(pid)
         var hit: AXUIElement?
         guard AXUIElementCopyElementAtPosition(appEl, Float(point.x), Float(point.y), &hit) == .success,
               let start = hit, let pane = paneElement(from: start) else { return true }
@@ -272,9 +310,16 @@ public final class AXFocusController: FocusController {
     }
 
     public func focusedDisplay() -> DisplayID? {
+        let now = ProcessInfo.processInfo.systemUptime
+        if let c = focusedDisplayCache, now - c.at < Self.focusedDisplayTTL { return c.display }
+        let d = queryFocusedDisplay()
+        focusedDisplayCache = (d, now)
+        return d
+    }
+
+    func queryFocusedDisplay() -> DisplayID? {
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
-        let a = AXUIElementCreateApplication(app.processIdentifier)
-        AXUIElementSetMessagingTimeout(a, 0.5)
+        let a = axApp(app.processIdentifier)
         guard let win = axElement(a, kAXFocusedWindowAttribute), let f = axFrame(win) else { return nil }
         return FocusLogic.displayOf(f, displays: Displays.all())
     }
@@ -315,20 +360,37 @@ public final class AXFocusController: FocusController {
         let ctl = AXFocusController()
         ctl.startTracking()
         let args = Array(CommandLine.arguments.dropFirst())
-        if args.first == "focus", args.count > 1, let idx = Int(args[1]) {
+        if let fi = args.firstIndex(of: "focus") {
+            // focus <idx> [<idx> ...]: focus each display in turn and time it.
             let displays = Displays.all()
-            guard displays.indices.contains(idx) else { print("no display \(idx) (have \(displays.count))"); exit(1) }
-            log("focusing display \(idx)")
-            let ok = ctl.focusDisplay(displays[idx].id, gazePoint: nil, movePointer: true)
-            log("pointer now \(CGEvent(source: nil)?.location ?? .zero)")
-            log("focusDisplay -> \(ok); focusedDisplay now \(String(describing: ctl.focusedDisplay()))")
-            if let app = NSWorkspace.shared.frontmostApplication { log("frontmost: \(app.localizedName ?? "?")") }
-            // Give the activation a moment, then exit so the next keystrokes go to the target.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                log("frontmost after 0.5s: \(NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"), display \(String(describing: ctl.focusedDisplay()))")
-                exit(ok ? 0 : 2)
+            let idxs = args[(fi + 1)...].compactMap { Int($0) }
+            guard !idxs.isEmpty else { print("usage: --focus-debug focus <displayIndex> [more indices...]"); exit(1) }
+            var failed = false
+            for idx in idxs {
+                guard displays.indices.contains(idx) else { print("no display \(idx) (have \(displays.count))"); exit(1) }
+                let id = displays[idx].id
+                let t0 = ProcessInfo.processInfo.systemUptime
+                let ok = ctl.focusDisplay(id, gazePoint: nil, movePointer: true)
+                let t1 = ProcessInfo.processInfo.systemUptime
+                // Wait until the target app is frontmost AND its focused window is on the target display.
+                var settled: Double? = nil
+                let deadline = t0 + 2
+                while ProcessInfo.processInfo.systemUptime < deadline {
+                    RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.001))
+                    if ok, NSWorkspace.shared.frontmostApplication?.processIdentifier == ctl.lastTargetPID,
+                       ctl.queryFocusedDisplay() == id {
+                        settled = ProcessInfo.processInfo.systemUptime - t0; break
+                    }
+                }
+                let name = NSRunningApplication(processIdentifier: ctl.lastTargetPID)?.localizedName ?? "?"
+                log(String(format: "display %d: focusDisplay=%.1f ms, settled=%@ ms, ok=%@, target=%@",
+                           idx, (t1 - t0) * 1000, settled.map { String(format: "%.1f", $0 * 1000) } ?? "TIMEOUT",
+                           ok ? "yes" : "no", name))
+                if !ok || settled == nil { failed = true }
+                let rest = Date(timeIntervalSinceNow: 0.7)   // let things settle between rounds
+                while Date() < rest { RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01)) }
             }
-            RunLoop.main.run()
+            exit(failed ? 2 : 0)
         }
         let mon = InputMonitor()
         mon.onUserClick = { p in log("click at \(Int(p.x)),\(Int(p.y))") }

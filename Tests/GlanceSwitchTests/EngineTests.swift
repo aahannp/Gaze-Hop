@@ -21,13 +21,14 @@ private final class FakeFocus: FocusController {
     var displayCalls: [(DisplayID, CGPoint?, Bool)] = []
     var paneCalls: [(CGPoint, Bool)] = []
     var focused: DisplayID? = 1
+    var focusedQueries = 0
     func focusDisplay(_ display: DisplayID, gazePoint: CGPoint?, movePointer: Bool) -> Bool {
         displayCalls.append((display, gazePoint, movePointer)); focused = display; return true
     }
     func focusWithinDisplay(at point: CGPoint, clickFallback: Bool) -> Bool {
         paneCalls.append((point, clickFallback)); return true
     }
-    func focusedDisplay() -> DisplayID? { focused }
+    func focusedDisplay() -> DisplayID? { focusedQueries += 1; return focused }
     func startTracking() {}
 }
 
@@ -39,7 +40,14 @@ private final class FakeInput: InputActivityMonitoring {
     func stop() {}
 }
 
+private final class FakeLog: LatencyLogging {
+    var isEnabled = true
+    var lines: [String] = []
+    func log(_ line: String) { lines.append(line) }
+}
+
 final class EngineTests: XCTestCase {
+    private var fakeLog: FakeLog!
     private var mapper: FakeMapper!
     private var focus: FakeFocus!
     private var input: FakeInput!
@@ -54,14 +62,18 @@ final class EngineTests: XCTestCase {
 
     override func setUp() {
         mapper = FakeMapper(); focus = FakeFocus(); input = FakeInput()
+        // Pin the original timings so the behaviour tests below read the same; defaults are tested separately.
         settings = Settings(); settings.windowFocusEnabled = false
+        settings.switchDelayMs = 300; settings.typingPauseSec = 2.0; settings.mousePriorityMs = 1500
+        fakeLog = FakeLog()
         clock = 100; scheduled = []
         engine = SwitchEngine(mapper: mapper, focus: focus, input: input,
                               settings: { [unowned self] in self.settings },
                               now: { [unowned self] in self.clock },
                               displayFrame: { [unowned self] in self.frames[$0] },
                               displayAt: { [unowned self] p in self.frames.first { $0.value.contains(p) }?.key },
-                              schedule: { [unowned self] _, b in self.scheduled.append(b) })
+                              schedule: { [unowned self] _, b in self.scheduled.append(b) },
+                              latencyLog: fakeLog)
     }
 
     private func pose() -> HeadPose {
@@ -107,7 +119,7 @@ final class EngineTests: XCTestCase {
 
     func testOffScreenInterruptsDwell() {
         gaze(2, CGPoint(x: 1500, y: 400), for: 0.2)
-        gaze(nil, CGPoint(x: 500, y: -900), for: 0.1)
+        gaze(nil, CGPoint(x: 500, y: -900), for: 0.3)
         gaze(2, CGPoint(x: 1500, y: 400), for: 0.2)
         XCTAssertTrue(focus.displayCalls.isEmpty)
     }
@@ -234,5 +246,76 @@ final class EngineTests: XCTestCase {
         engine.handle(pose: nil)
         gaze(2, CGPoint(x: 1500, y: 400), for: 0.2)
         XCTAssertTrue(focus.displayCalls.isEmpty)
+    }
+
+    // MARK: latency-fix behaviour
+
+    func testNewDefaultsAreSnappy() {
+        let d = Settings()
+        XCTAssertEqual(d.switchDelayMs, 150)
+        XCTAssertEqual(d.typingPauseSec, 0.8)
+        XCTAssertEqual(d.mousePriorityMs, 600)
+    }
+
+    func testSavedSettingsKeepTheirOwnValues() throws {
+        var custom = Settings(); custom.switchDelayMs = 700; custom.typingPauseSec = 3
+        let suite = UserDefaults(suiteName: "glance.test.\(UUID().uuidString)")!
+        suite.set(try JSONEncoder().encode(custom), forKey: SettingsStore.key)
+        let loaded = SettingsStore(defaults: suite).settings
+        XCTAssertEqual(loaded.switchDelayMs, 700)
+        XCTAssertEqual(loaded.typingPauseSec, 3)
+        // Nothing saved => the new defaults.
+        XCTAssertEqual(SettingsStore(defaults: UserDefaults(suiteName: "glance.test.\(UUID().uuidString)")!).settings.switchDelayMs, 150)
+    }
+
+    func testShortOffScreenGapKeepsDwell() {
+        gaze(2, CGPoint(x: 1500, y: 400), for: 0.2)
+        gaze(nil, CGPoint(x: 1000, y: -50), for: 0.07)    // < offScreenGrace
+        gaze(2, CGPoint(x: 1500, y: 400), for: 0.2)
+        XCTAssertEqual(focus.displayCalls.count, 1)
+    }
+
+    func testLongOffScreenGapResetsDwell() {
+        gaze(2, CGPoint(x: 1500, y: 400), for: 0.2)
+        gaze(nil, CGPoint(x: 1000, y: -50), for: 0.3)     // > offScreenGrace
+        gaze(2, CGPoint(x: 1500, y: 400), for: 0.2)
+        XCTAssertTrue(focus.displayCalls.isEmpty)
+    }
+
+    func testFocusedDisplayQueryIsThrottledWhileMouseActive() {
+        input.lastMouseTime = clock + 100                  // mouse "active" for the whole run
+        gaze(1, CGPoint(x: 500, y: 400), for: 1.0)         // ~15 poses
+        XCTAssertLessThanOrEqual(focus.focusedQueries, 6)  // init query + ~4 Hz
+    }
+
+    func testStaleFocusCacheDoesNotRevertSwitch() {
+        input.lastMouseTime = 0
+        gaze(2, CGPoint(x: 1500, y: 400), for: 0.31)
+        XCTAssertEqual(engine.currentDisplay, 2)
+        focus.focused = 1                                   // controller hasn't caught up
+        input.lastMouseTime = clock                         // mouse now active
+        gaze(2, CGPoint(x: 1500, y: 400), for: 0.1)
+        XCTAssertEqual(engine.currentDisplay, 2)
+    }
+
+    func testLatencyLogRecordsBreakdownWithHold() {
+        input.lastKeyTime = clock                            // typing hold 2 s
+        gaze(2, CGPoint(x: 1500, y: 400), for: 2.6)
+        XCTAssertEqual(fakeLog.lines.count, 1)
+        let l = fakeLog.lines[0]
+        XCTAssertTrue(l.contains("display=2"), l)
+        XCTAssertTrue(l.contains("hold=typing"), l)
+        XCTAssertTrue(l.contains("dwell=") && l.contains("focus=") && l.contains("total="), l)
+    }
+
+    func testLatencyLogWithoutHold() {
+        gaze(2, CGPoint(x: 1500, y: 400), for: 0.5)
+        XCTAssertTrue(fakeLog.lines.first?.contains("hold=none") == true)
+    }
+
+    func testLatencyLogDisabledWritesNothing() {
+        fakeLog.isEnabled = false
+        gaze(2, CGPoint(x: 1500, y: 400), for: 0.5)
+        XCTAssertTrue(fakeLog.lines.isEmpty)
     }
 }
