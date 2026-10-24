@@ -1,0 +1,28 @@
+name: Build check
+
+# Not a publisher. Updates are only installed when the new app is signed by the same signer as the running one,
+# and CI doesn't have that certificate, so releases are cut locally with ./release.sh. This workflow just proves
+# that the tests pass and the dmg builds for a pushed tag (the ad-hoc signed result is thrown away).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Tag matches VERSION
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          [ "${GITHUB_REF_NAME}" = "v$(tr -d '[:space:]' < VERSION)" ] || { echo "::error::tag ${GITHUB_REF_NAME} does not match VERSION"; exit 1; }
+
+      - run: swift test
+      - run: ./build.sh

@@ -57,6 +57,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     // MARK: Launch
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        Updater.shared.start()
         mapper.trackerKind = trackerKind      // before load(): profiles are keyed by tracker kind
         try? mapper.load()
         syncMapperMode()

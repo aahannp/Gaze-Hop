@@ -31,13 +31,26 @@ Everything runs on your Mac. Camera frames are processed in memory and never sav
 
 macOS 14 or later and a webcam (built-in or external). Built with Swift 5.9 or later (Xcode 15+).
 
+## Install and updates
+
+Download `GazeHop-<version>.dmg` from the latest GitHub release and drag GazeHop to Applications.
+GazeHop checks GitHub for a newer release on launch and every 6 hours (Settings → Updates to turn
+that off). Installing an update downloads the dmg from GitHub, checks that it is signed by the same
+signer with the same bundle id as the running app, replaces `/Applications/GazeHop.app` and relaunches.
+
 ## Build and run
 
 ```sh
-./build.sh            # swift build -c release -> build/GlanceSwitch.app (signed)
-./build.sh install    # also copies it to ~/Applications and launches it
+./build.sh            # swift build -c release -> build/GazeHop-<version>.dmg (signed)
+./build.sh install    # also installs /Applications/GazeHop.app and launches it
 swift test            # unit tests
+./release.sh [patch|minor|major|X.Y.Z]   # bump VERSION, build, tag, `gh release create`
 ```
+
+The `.app` only exists in a temporary staging folder and in `/Applications`; `build/` holds just the dmg.
+The version lives in `VERSION`. (The Swift targets, bundle id `com.aahan.glanceswitch` and the
+`Application Support/GlanceSwitch` folder keep their old names so camera/Accessibility grants and
+calibration carry over from Glance Switch.)
 
 The app bundle and Swift targets still use the working name `GlanceSwitch`.
 
