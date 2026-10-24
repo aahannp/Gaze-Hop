@@ -37,6 +37,8 @@ struct WelcomeView: View {
                 .font(.caption).foregroundStyle(.secondary)
 
             HStack {
+                Text("Moved monitors or changed your setup? Use Recalibrate… from the menu bar (⌘R) any time.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("Calibrate") { onCalibrate() }
                     .keyboardShortcut(.defaultAction)

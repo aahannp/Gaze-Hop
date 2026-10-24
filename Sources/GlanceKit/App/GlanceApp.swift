@@ -109,7 +109,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         menu.addItem(inputWarnItem)
         menu.addItem(pauseItem)
         menu.addItem(driftItem)
-        menu.addItem(item("Recalibrate", #selector(recalibrateAction)))
+        menu.addItem(item("Recalibrate…", #selector(recalibrateAction), key: "r"))
         menu.addItem(.separator())
         menu.addItem(item("Settings…", #selector(openSettings), key: ","))
         menu.addItem(item("Welcome Guide", #selector(openWelcome)))
@@ -217,24 +217,41 @@ final class AppController: NSObject, NSApplicationDelegate {
         if on { suspendReasons.insert(reason) } else { suspendReasons.remove(reason) }
         if on, calibrating { calibrator.cancel() }
         updateCamera()
+        if !on, reason == "sleep" || reason == "screens" { displaysReconfigured() }
     }
 
+    /// Displays changed or the Mac woke: reload the profile for the current arrangement.
+    /// A matching saved profile resumes silently; otherwise ask to recalibrate.
     private func displaysReconfigured() {
         reconfigWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
+            guard let self, !self.calibrating else { return }
             self.engine.reset()
             if self.tracker.isRunning { self.tracker.stop() }
-            self.updateCamera()
-            guard !self.calibrating, Permissions.cameraGranted, Permissions.accessibilityGranted else { return }
-            let sig = Self.arrangementSignature()
-            let saved = UserDefaults.standard.string(forKey: self.arrangementKey)
-            if !self.mapper.isCalibrated || (saved != nil && saved != sig) {
-                self.suggestRecalibration(reason: "Your display arrangement changed.")
-            }
+            try? self.mapper.load()
+            self.updateCamera()   // stays off while uncalibrated, i.e. tracking is paused until done
+            guard !self.mapper.isCalibrated, Permissions.cameraGranted, Permissions.accessibilityGranted,
+                  self.welcomeWindow?.isVisible != true else { return }
+            self.promptRecalibrate()
         }
         reconfigWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+    }
+
+    private var promptShowing = false
+    private func promptRecalibrate() {
+        guard !promptShowing, !calibrating else { return }
+        promptShowing = true
+        driftItem.isHidden = false
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Your displays changed — Recalibrate now?"
+        alert.informativeText = "Glance Switch has no calibration for this display arrangement, so tracking is paused until you recalibrate."
+        alert.addButton(withTitle: "Recalibrate")
+        alert.addButton(withTitle: "Later")
+        let response = alert.runModal()
+        promptShowing = false
+        if response == .alertFirstButtonReturn { startCalibration() }
     }
 
     private static func arrangementSignature() -> String {

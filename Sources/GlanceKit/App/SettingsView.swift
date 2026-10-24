@@ -46,7 +46,7 @@ struct SettingsView: View {
                 Toggle("Learn from my clicks", isOn: s.learnFromClicks)
                 Toggle("Show gaze dot", isOn: s.showGazeDot)
                 HStack {
-                    Button("Recalibrate…", action: onRecalibrate)
+                    Button("Recalibrate…", action: onRecalibrate).buttonStyle(.borderedProminent)
                     Button("Reset calibration…") { confirmReset = true }
                 }
             }
