@@ -92,3 +92,38 @@ final class CalibrationRealDataEval: XCTestCase {
         }
     }
 }
+
+extension CalibrationRealDataEval {
+    /// Sweep of leaveThreshold, split by near-shared-edge band (20% of display width) vs the rest.
+    func testSweepLeaveThreshold() throws {
+        guard let raw = Self.loadRaw() else { throw XCTSkip("no real calibration profile") }
+        let cal = raw.indices.filter { raw[$0].w >= 0.9 }
+        let minPitch = raw.map { $0.f[1] }.min()!
+        func nearEdge(_ r: Raw) -> Bool { r.x < 0 ? r.x > -0.2 * 1470 : r.x < 0.2 * 2560 }
+        let saved = DisplayClassifier.leaveThreshold
+        defer { DisplayClassifier.leaveThreshold = saved }
+        for th in [0.6, 0.7, 0.8, 0.85, 0.9] {
+            DisplayClassifier.leaveThreshold = th
+            var extFalseFar = 0, extFalse = 0, extN = 0, kbFalse = 0, lapMissFar = 0, lapFar = 0, lapMissEdge = 0, lapEdge = 0
+            var extMissFar = 0, extFar = 0, extMissEdge = 0, extEdge = 0, lapFalse = 0, lapN = 0
+            var missedFar: [String] = []
+            for i in cal {
+                let m = mapper(train: cal.filter { $0 != i }.map { raw[$0] }, classifier: true)
+                let r = raw[i], e = nearEdge(r)
+                if Self.label(r) == 2 {
+                    extN += 1
+                    if m.estimate(Self.pose(r.f), currentDisplay: 2, edgeBias: 0.5, displays: Self.displays)?.displayID == 1 { extFalse += 1; if !e { extFalseFar += 1 } }
+                    if m.estimate(Self.pose(r.f, pitch: minPitch - 0.3), currentDisplay: 2, edgeBias: 0.5, displays: Self.displays)?.displayID == 1 { kbFalse += 1 }
+                    let g = m.estimate(Self.pose(r.f), currentDisplay: 1, edgeBias: 0.5, displays: Self.displays)?.displayID
+                    if e { extEdge += 1; if g != 2 { extMissEdge += 1 } } else { extFar += 1; if g != 2 { extMissFar += 1; missedFar.append("ext#\(i) x=\(Int(r.x))") } }
+                } else {
+                    lapN += 1
+                    if m.estimate(Self.pose(r.f), currentDisplay: 1, edgeBias: 0.5, displays: Self.displays)?.displayID == 2 { lapFalse += 1 }
+                    let g = m.estimate(Self.pose(r.f), currentDisplay: 2, edgeBias: 0.5, displays: Self.displays)?.displayID
+                    if e { lapEdge += 1; if g != 1 { lapMissEdge += 1 } } else { lapFar += 1; if g != 1 { lapMissFar += 1; missedFar.append("lap#\(i) x=\(Int(r.x))") } }
+                }
+            }
+            print("SWEEP th=\(th) falseExt=\(extFalse)/\(extN) (non-edge \(extFalseFar)) falseKeyboard=\(kbFalse)/\(extN) falseLap=\(lapFalse)/\(lapN) | missed non-edge: ext->lap \(lapMissFar)/\(lapFar), lap->ext \(extMissFar)/\(extFar) | edge: \(lapMissEdge)/\(lapEdge), \(extMissEdge)/\(extEdge) | \(missedFar)")
+        }
+    }
+}

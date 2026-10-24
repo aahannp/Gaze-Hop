@@ -99,7 +99,7 @@ struct DisplayClassifier: Codable, Equatable {
     static let minPerClass = 4
     static let edgeBiasStrength = 6.0     // nats of log-odds at edgeBias 0 / 1
     static let enterPrimaryThreshold = 0.65 // returning to the largest display is allowed to be easier
-    static let leaveThreshold = 0.9       // posterior needed to LEAVE the current display
+    static var leaveThreshold = 0.8       // posterior needed to LEAVE the current display
     static let pitchIndex = 1
 
     var featureIndex: [Int]
