@@ -44,23 +44,41 @@ echo "==> swift build -c release"
 swift build -c release
 BIN="$(swift build -c release --show-bin-path)/$APP_NAME"
 
-echo "==> assembling $APP"
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN" "$APP/Contents/MacOS/$APP_NAME"
-cp Resources/Info.plist "$APP/Contents/Info.plist"
+# ~/Desktop is iCloud-synced: Finder info / resource forks get attached to files there and make codesign
+# fail ("detritus"). Assemble and sign in a non-synced staging dir, then copy the signed bundle out.
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/glanceswitch-build.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+SAPP="$STAGE/$APP_NAME.app"
+COPY=(ditto --norsrc --noextattr)
+
+echo "==> assembling $SAPP"
+mkdir -p "$SAPP/Contents/MacOS" "$SAPP/Contents/Resources/Models"
+"${COPY[@]}" "$BIN" "$SAPP/Contents/MacOS/$APP_NAME"
+"${COPY[@]}" Resources/Info.plist "$SAPP/Contents/Info.plist"
+
+# MediaPipe mesh tracker models (MeshModelPaths.locate looks in Contents/Resources/Models).
+for m in Sources/GlanceKit/Tracking/Models/*.onnx; do
+  "${COPY[@]}" "$m" "$SAPP/Contents/Resources/Models/$(basename "$m")"
+done
+
+# onnxruntime is linked statically; make sure nothing points back into the build tree or a loose dylib.
+if otool -L "$SAPP/Contents/MacOS/$APP_NAME" | tail -n +2 | awk '{print $1}' \
+     | grep -Ev '^(/usr/lib/|/System/Library/)'; then
+  echo "error: binary links against a non-system library (listed above); embed + sign it in Contents/Frameworks" >&2
+  exit 1
+fi
 
 # Generated icon (eye glyph on a gradient squircle) — best effort.
 if [[ -f Resources/make_icon.swift ]]; then
   ICONSET=$(mktemp -d)/AppIcon.iconset
-  if swift Resources/make_icon.swift "$ICONSET" >/dev/null 2>&1 && iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns" 2>/dev/null; then
+  if swift Resources/make_icon.swift "$ICONSET" >/dev/null 2>&1 && iconutil -c icns "$ICONSET" -o "$SAPP/Contents/Resources/AppIcon.icns" 2>/dev/null; then
     :
   else
     echo "warning: icon generation failed; continuing without icon"
   fi
 fi
 
-xattr -cr "$APP" 2>/dev/null || true
+xattr -cr "$SAPP" 2>/dev/null || true
 IDENTITY="$(find_identity || true)"
 if [[ -z "$IDENTITY" ]]; then
   echo
@@ -76,20 +94,24 @@ fi
 if [[ -n "$IDENTITY" ]]; then
   echo "==> codesign with \"$IDENTITY\""
   codesign --force --deep --identifier "$BUNDLE_ID" \
-    --entitlements Resources/GlanceSwitch.entitlements --sign "$IDENTITY" "$APP" \
+    --entitlements Resources/GlanceSwitch.entitlements --sign "$IDENTITY" "$SAPP" \
     || { echo "warning: signing with \"$IDENTITY\" failed; falling back to ad-hoc"; IDENTITY=""; }
 fi
 if [[ -z "$IDENTITY" ]]; then
   echo "warning: signing ad-hoc — permissions will need re-granting after every rebuild"
-  codesign --force --deep --identifier "$BUNDLE_ID" --entitlements Resources/GlanceSwitch.entitlements --sign - "$APP"
+  codesign --force --deep --identifier "$BUNDLE_ID" --entitlements Resources/GlanceSwitch.entitlements --sign - "$SAPP"
 fi
-codesign --verify --deep "$APP" && echo "==> built $APP"
+codesign --verify --deep --strict "$SAPP"
+
+rm -rf "$APP"; mkdir -p build
+"${COPY[@]}" "$SAPP" "$APP"
+echo "==> built $APP (signed in $STAGE)"
 
 if [[ "${1:-}" == "install" ]]; then
   mkdir -p ~/Applications
   pkill -x "$APP_NAME" 2>/dev/null || true
   rm -rf ~/Applications/$APP_NAME.app
-  cp -R "$APP" ~/Applications/
+  "${COPY[@]}" "$SAPP" ~/Applications/$APP_NAME.app
   echo "==> installed to ~/Applications/$APP_NAME.app"
   open ~/Applications/$APP_NAME.app
 fi

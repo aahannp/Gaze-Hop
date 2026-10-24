@@ -7,6 +7,10 @@ struct SettingsView: View {
     var onRecalibrate: () -> Void
     var onResetCalibration: () -> Void
     var liveModel: LiveFaceModel
+    var meshAvailable = true
+    var isCalibrated: () -> Bool = { true }
+    var onTrackerChange: (String) -> Void = { _ in }
+    @State private var trackerKind = UserDefaults.standard.string(forKey: PoseTrackerFactory.defaultsKey) ?? "vision"
     /// True when the eye model hasn't been calibrated yet (reported by the mapper, if it can).
     var needsEyeCalibration: () -> Bool = { false }
     private let cameras = CameraPoseTracker.availableCameras()
@@ -52,6 +56,22 @@ struct SettingsView: View {
                     }
                 }
                 Text(modeCaption).font(.caption).foregroundStyle(.secondary)
+                Picker("Eye tracker", selection: Binding(get: { trackerKind }, set: { trackerKind = $0; onTrackerChange($0) })) {
+                    Text("Apple Vision").tag("vision")
+                    Text("MediaPipe (better eye tracking)").tag("mesh")
+                }
+                .disabled(!meshAvailable)
+                if !meshAvailable {
+                    Text("MediaPipe models aren't bundled in this build.").font(.caption).foregroundStyle(.secondary)
+                }
+                if trackerKind == "mesh", !isCalibrated() {
+                    HStack {
+                        Label("MediaPipe needs its own calibration.", systemImage: "exclamationmark.triangle")
+                            .font(.caption).foregroundStyle(.orange)
+                        Spacer()
+                        Button("Calibrate for MediaPipe", action: onRecalibrate)
+                    }
+                }
                 if store.settings.gazeMode != .head, needsEyeCalibration() {
                     HStack {
                         Label("Eye tracking needs a fresh calibration.", systemImage: "exclamationmark.triangle")

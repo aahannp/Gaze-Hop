@@ -21,11 +21,13 @@ public enum GlanceApp {
 /// `needsEyeCalibration`; add `extension RegressionGazeMapper: EyeCalibrationReporting {}` once it lands).
 protocol EyeCalibrationReporting: AnyObject { var needsEyeCalibration: Bool { get } }
 
+extension RegressionGazeMapper: EyeCalibrationReporting {}
+
 final class AppController: NSObject, NSApplicationDelegate {
     private let store = SettingsStore()
     private let hub = PoseHub()
-    private let tracker: PoseSource = CameraPoseTracker()
-    private let mapper: GazeMapper = RegressionGazeMapper()
+    private var tracker: PoseSource = PoseTrackerFactory.make()
+    private let mapper: RegressionGazeMapper = RegressionGazeMapper()
     private let focus: FocusController = AXFocusController()
     private let input: InputActivityMonitoring = InputMonitor()
     private let calibrator: Calibrating = CalibrationController()
@@ -55,6 +57,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     // MARK: Launch
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        mapper.trackerKind = trackerKind      // before load(): profiles are keyed by tracker kind
         try? mapper.load()
         syncMapperMode()
         liveModel.onVisibilityChange = { [weak self] in self?.updateCamera() }
@@ -150,6 +153,28 @@ final class AppController: NSObject, NSApplicationDelegate {
     @objc private func togglePauseAction() { togglePause() }
     @objc private func recalibrateAction() { recalibrate() }
     @objc private func quit() { NSApp.terminate(nil) }
+
+    // MARK: Tracker choice
+
+    /// "vision" or "mesh" (MediaPipe), whichever the live tracker is.
+    private var trackerKind: String { tracker is MeshPoseTracker ? "mesh" : "vision" }
+
+    /// Settings → Eye tracker. Persists the choice, swaps the tracker live and re-keys the calibration.
+    /// Never opens calibration by itself; the Settings button does that when the user asks.
+    private func switchTracker(to kind: String) {
+        UserDefaults.standard.set(kind, forKey: PoseTrackerFactory.defaultsKey)
+        guard kind != trackerKind else { return }
+        tracker.onPose = nil
+        tracker.stop()
+        tracker = PoseTrackerFactory.make()                  // falls back to Vision if the models are missing
+        tracker.onPose = { [hub] in hub.publish($0) }        // the hub is the subscription point; observers stay
+        engine.reset()
+        mapper.trackerKind = trackerKind
+        try? mapper.load()
+        syncMapperMode()
+        updateCamera()   // starts it again if tracking is wanted (calibrated) or the live view is open
+        refreshStatusIcon()
+    }
 
     func togglePause() { store.settings.paused.toggle() }
 
@@ -379,6 +404,9 @@ final class AppController: NSObject, NSApplicationDelegate {
                                     onRecalibrate: { [weak self] in self?.recalibrate() },
                                     onResetCalibration: { [weak self] in self?.resetCalibration() },
                                     liveModel: liveModel,
+                                    meshAvailable: MeshModelPaths.locate() != nil,
+                                    isCalibrated: { [weak self] in self?.mapper.isCalibrated ?? false },
+                                    onTrackerChange: { [weak self] in self?.switchTracker(to: $0) },
                                     needsEyeCalibration: { [weak self] in
                                         (self?.mapper as? EyeCalibrationReporting)?.needsEyeCalibration ?? false
                                     })
