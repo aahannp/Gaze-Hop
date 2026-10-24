@@ -320,6 +320,7 @@ public final class AXFocusController: FocusController {
             guard displays.indices.contains(idx) else { print("no display \(idx) (have \(displays.count))"); exit(1) }
             log("focusing display \(idx)")
             let ok = ctl.focusDisplay(displays[idx].id, gazePoint: nil, movePointer: true)
+            log("pointer now \(CGEvent(source: nil)?.location ?? .zero)")
             log("focusDisplay -> \(ok); focusedDisplay now \(String(describing: ctl.focusedDisplay()))")
             if let app = NSWorkspace.shared.frontmostApplication { log("frontmost: \(app.localizedName ?? "?")") }
             // Give the activation a moment, then exit so the next keystrokes go to the target.
