@@ -75,7 +75,7 @@ fi
 
 if [[ -n "$IDENTITY" ]]; then
   echo "==> codesign with \"$IDENTITY\""
-  codesign --force --deep --options runtime --identifier "$BUNDLE_ID" \
+  codesign --force --deep --identifier "$BUNDLE_ID" \
     --entitlements Resources/GlanceSwitch.entitlements --sign "$IDENTITY" "$APP" \
     || { echo "warning: signing with \"$IDENTITY\" failed; falling back to ad-hoc"; IDENTITY=""; }
 fi
