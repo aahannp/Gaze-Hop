@@ -388,6 +388,27 @@ public final class RegressionGazeMapper: GazeMapper {
             .joined(separator: "|")
     }
 
+    /// Which tracker produced the features ("vision", "mesh"...). Their scales differ, so each kind has its own
+    /// profiles. Profiles saved before this existed are "vision".
+    public var trackerKind: String {
+        get { lock.lock(); defer { lock.unlock() }; return _trackerKind }
+        set {
+            lock.lock(); defer { lock.unlock() }
+            guard newValue != _trackerKind else { return }
+            stashActive(displays: displaysProvider())   // keep the live edits of the kind we are leaving
+            _trackerKind = newValue
+            activeSignature = nil                      // next use activates this kind's profile (empty if none)
+            _ = syncToCurrent()
+        }
+    }
+    private var _trackerKind = "vision"
+
+    /// Profile key: the plain arrangement signature for "vision" (the old format), `kind#signature` otherwise.
+    private func profileKey(for d: [Displays.Info]) -> String {
+        let sig = Self.signature(of: d)
+        return _trackerKind == "vision" ? sig : "\(_trackerKind)#\(sig)"
+    }
+
     /// Switch the live state to the profile for `sig` (caller holds the lock).
     private func activate(_ sig: String, displays: [Displays.Info]) {
         guard sig != activeSignature else { return }
@@ -421,7 +442,7 @@ public final class RegressionGazeMapper: GazeMapper {
 
     private func syncToCurrent() -> [Displays.Info] {
         let d = displaysProvider()
-        activate(Self.signature(of: d), displays: d)
+        activate(profileKey(for: d), displays: d)
         return d
     }
 
@@ -462,7 +483,7 @@ public final class RegressionGazeMapper: GazeMapper {
     func estimate(_ pose: HeadPose, currentDisplay: DisplayID?, edgeBias: Double,
                   displays: [Displays.Info]) -> GazeEstimate? {
         lock.lock()
-        activate(Self.signature(of: displays), displays: displays)
+        activate(profileKey(for: displays), displays: displays)
         let m = model, em = eyeModel, eclf = eyeClassifier
         if classifier == nil, m != nil, !classifierTried {
             classifierTried = true
@@ -620,7 +641,7 @@ public final class RegressionGazeMapper: GazeMapper {
     public func reset() {
         lock.lock(); defer { lock.unlock() }
         let d = displaysProvider()
-        let sig = Self.signature(of: d)
+        let sig = profileKey(for: d)
         profiles[sig] = nil
         activeSignature = sig
         calibration = []; clicks = []; model = nil; classifier = nil; eyeModel = nil; eyeClassifier = nil; lastEye = nil; classifierTried = false; drift = 0; clicksSinceFit = 0
