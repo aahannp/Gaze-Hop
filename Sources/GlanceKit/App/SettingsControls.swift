@@ -95,20 +95,15 @@ struct TileIcon: View {
     }
 }
 
-/// GazeHop's own mark: an eye on an accent-coloured tile.
+/// GazeHop's app icon (BrandMark). `size` is the tile; the icon's grid margin and shadow overhang it.
 struct AppGlyph: View {
     var size: CGFloat = 64
 
     var body: some View {
-        RoundedRectangle(cornerRadius: size * 0.24, style: .continuous)
-            .fill(Color.accentColor.gradient)
-            .frame(width: size, height: size)
-            .overlay {
-                Image(systemName: "eye")
-                    .font(.system(size: size * 0.46, weight: .medium))
-                    .foregroundStyle(.white)
-            }
-            .shadow(color: .black.opacity(0.15), radius: size * 0.06, y: size * 0.03)
+        let canvas = size * 1024 / 824
+        Image(nsImage: BrandMark.appIcon(size: canvas))
+            .frame(width: canvas, height: canvas)
+            .padding(-(canvas - size) / 2)
             .accessibilityHidden(true)
     }
 }
