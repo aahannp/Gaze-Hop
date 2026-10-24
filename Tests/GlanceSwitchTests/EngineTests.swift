@@ -73,6 +73,7 @@ final class EngineTests: XCTestCase {
         mapper = FakeMapper(); focus = FakeFocus(); input = FakeInput()
         // Pin the original timings so the behaviour tests below read the same; defaults are tested separately.
         settings = Settings(); settings.windowFocusEnabled = false
+        settings.gazeMode = .head   // fast-path motion is head yaw unless a test says otherwise
         settings.switchDelayMs = 300; settings.typingPauseSec = 2.0; settings.mousePriorityMs = 1500
         fakeLog = FakeLog(); fakeTrace = FakeTrace()
         clock = 100; scheduled = []
@@ -87,10 +88,12 @@ final class EngineTests: XCTestCase {
     }
 
     private var yaw = 0.0
+    private var eyeDX = 0.0
+    private var openness = 1.0
 
     private func pose() -> HeadPose {
         HeadPose(timestamp: clock, yaw: yaw, pitch: 0, roll: 0, faceCenter: .zero, faceSize: 0.3,
-                 eyeOffset: .zero, confidence: 1)
+                 eyeOffset: CGVector(dx: eyeDX, dy: 0), confidence: 1, eyeOpenness: openness)
     }
 
     /// Feed poses every 66 ms for `seconds`, gaze fixed at `point`.
@@ -339,6 +342,12 @@ final class EngineTests: XCTestCase {
         for _ in 0..<frames { yaw += step; engine.handle(pose: pose()); clock += 0.066 }
     }
 
+    /// Eye saccade: eye offset advancing by `step` per frame, head still.
+    private func saccade(_ display: DisplayID?, _ point: CGPoint, step: Double, frames: Int, open: Double = 1) {
+        mapper.next = GazeEstimate(point: point, displayID: display, confidence: 0.9)
+        for _ in 0..<frames { eyeDX += step; openness = open; engine.handle(pose: pose()); clock += 0.066 }
+    }
+
     private func noFace(for seconds: Double) {
         let end = clock + seconds
         while clock < end { engine.handle(pose: nil); clock += 0.066 }
@@ -578,5 +587,57 @@ final class EngineTests: XCTestCase {
         gaze(nil, CGPoint(x: 1000, y: -50), for: 0.07)
         gaze(2, CGPoint(x: 1050, y: 400), for: 0.2)
         XCTAssertEqual(focus.displayCalls.count, 1)
+    }
+
+    // MARK: mode-aware fast path
+
+    func testEyesModeFastPathUsesEyeMotion() {
+        settings.gazeMode = .eyes; engine.fastFrames = 2
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.4)
+        turn(2, CGPoint(x: 1500, y: 400), step: 0.1, frames: 3)     // head turns, eyes still: not enough in eyes mode
+        XCTAssertTrue(focus.displayCalls.isEmpty)
+        saccade(2, CGPoint(x: 1500, y: 400), step: 0.2, frames: 3)
+        XCTAssertEqual(focus.displayCalls.count, 1)
+        XCTAssertTrue(lines("switch").first?.contains("fast=1") == true, "\(fakeLog.lines)")
+    }
+
+    func testHeadModeIgnoresEyeMotion() {
+        settings.gazeMode = .head; engine.fastFrames = 2
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.4)
+        saccade(2, CGPoint(x: 1500, y: 400), step: 0.15, frames: 3)
+        XCTAssertTrue(focus.displayCalls.isEmpty)
+    }
+
+    func testEyeMotionAwayFromTargetDoesNotCount() {
+        settings.gazeMode = .eyes; engine.fastFrames = 2
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.4)
+        saccade(2, CGPoint(x: 1500, y: 400), step: -0.15, frames: 3)
+        XCTAssertTrue(focus.displayCalls.isEmpty)
+    }
+
+    func testBlinkFramesNeverCountAsEyeMotion() {
+        settings.gazeMode = .eyes; engine.fastFrames = 2
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.4)
+        saccade(2, CGPoint(x: 1500, y: 400), step: 0.15, frames: 4, open: 0.1)   // eyelids shut: offset is garbage
+        XCTAssertTrue(focus.displayCalls.isEmpty)
+    }
+
+    func testBothModeBlendsByEyeWeight() {
+        // A head turn at twice its threshold and still eyes: score = (1 - w) * 2.
+        for (w, expectFast) in [(0.5, true), (0.7, false)] {
+            setUp()
+            settings.gazeMode = .both; settings.eyeWeight = w; engine.fastFrames = 2
+            gaze(1, CGPoint(x: 500, y: 400), for: 0.4)
+            turn(2, CGPoint(x: 1500, y: 400), step: 0.03, frames: 4)
+            XCTAssertEqual(focus.displayCalls.count, expectFast ? 1 : 0, "eyeWeight \(w)")
+            if expectFast { XCTAssertTrue(lines("switch").first?.contains("fast=1") == true, "\(fakeLog.lines)") }
+        }
+    }
+
+    func testBothModeWeakSignalsStayOnFullDwell() {
+        settings.gazeMode = .both; settings.eyeWeight = 0.5; engine.fastFrames = 2
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.4)
+        turn(2, CGPoint(x: 1500, y: 400), step: 0.014, frames: 4)   // head only, ~60%
+        XCTAssertTrue(focus.displayCalls.isEmpty)
     }
 }
