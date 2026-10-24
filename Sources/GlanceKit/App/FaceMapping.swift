@@ -16,6 +16,8 @@ public struct FaceAngles: Equatable {
 public enum FaceMapping {
     public static let maxYaw = 1.0, maxPitch = 0.8, maxRoll = 0.7
     public static let maxEyeYaw = 0.55, maxEyePitch = 0.45
+    /// Head angles (radians) that read as a full-scale signal: about where you'd turn to look at a side display.
+    public static let signalYaw = 0.6, signalPitch = 0.4
     /// faceSize that reads as "normal distance" (bbox width / frame width).
     public static let referenceFaceSize = 0.3
 
@@ -46,24 +48,8 @@ public enum FaceMapping {
     }
     public static func signals(from pose: HeadPose?) -> Signals {
         guard let p = pose else { return Signals() }
-        return Signals(headX: clamp(p.yaw / 0.6, 1), headY: clamp(p.pitch / 0.4, 1),
+        return Signals(headX: clamp(p.yaw / signalYaw, 1), headY: clamp(p.pitch / signalPitch, 1),
                        eyeX: clamp(Double(p.eyeOffset.dx), 1), eyeY: clamp(Double(p.eyeOffset.dy), 1))
-    }
-}
-
-/// Exponential smoothing so the face glides at 60 fps between ~15 Hz camera frames.
-public enum FaceSmoother {
-    public static func step(_ cur: FaceAngles, toward t: FaceAngles, dt: Double,
-                            tau: Double = 0.07, blinkTau: Double = 0.03) -> FaceAngles {
-        let k = 1 - exp(-max(dt, 0) / tau), kb = 1 - exp(-max(dt, 0) / blinkTau)
-        func f(_ a: Double, _ b: Double, _ k: Double) -> Double { a + (b - a) * k }
-        var o = cur
-        o.yaw = f(cur.yaw, t.yaw, k); o.pitch = f(cur.pitch, t.pitch, k); o.roll = f(cur.roll, t.roll, k)
-        o.leanX = f(cur.leanX, t.leanX, k); o.leanY = f(cur.leanY, t.leanY, k); o.scale = f(cur.scale, t.scale, k)
-        o.eyeYaw = f(cur.eyeYaw, t.eyeYaw, k * 1.6 > 1 ? 1 : k * 1.6)   // saccades are quick
-        o.eyePitch = f(cur.eyePitch, t.eyePitch, k * 1.6 > 1 ? 1 : k * 1.6)
-        o.openness = f(cur.openness, t.openness, kb)
-        return o
     }
 }
 

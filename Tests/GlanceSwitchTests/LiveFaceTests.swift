@@ -54,27 +54,6 @@ final class LiveFaceTests: XCTestCase {
         XCTAssertEqual(FaceMapping.signals(from: nil), FaceMapping.Signals())
     }
 
-    // MARK: Smoothing
-
-    func testSmootherConvergesWithoutOvershoot() {
-        var cur = FaceAngles()
-        var target = FaceAngles(); target.yaw = 0.8; target.openness = 0
-        var last = 0.0
-        for _ in 0..<120 {                       // 2 s at 60 fps
-            cur = FaceSmoother.step(cur, toward: target, dt: 1.0 / 60)
-            XCTAssertGreaterThanOrEqual(cur.yaw, last); XCTAssertLessThanOrEqual(cur.yaw, 0.8)
-            last = cur.yaw
-        }
-        XCTAssertEqual(cur.yaw, 0.8, accuracy: 1e-3)
-        XCTAssertEqual(cur.openness, 0, accuracy: 1e-3)
-    }
-
-    func testBlinkIsFasterThanHeadMotion() {
-        var target = FaceAngles(); target.yaw = 1; target.openness = 0
-        let a = FaceSmoother.step(FaceAngles(), toward: target, dt: 1.0 / 60)
-        XCTAssertGreaterThan(1 - a.openness, a.yaw)
-    }
-
     // MARK: Mini-map
 
     func testMiniMapDrawsDisplaysToScale() {
@@ -90,51 +69,6 @@ final class LiveFaceTests: XCTestCase {
         XCTAssertTrue(r2.contains(p))
         let off = m.point(CGPoint(x: 9000, y: -5000), clampedTo: CGRect(x: 0, y: 0, width: 324, height: 224))
         XCTAssertEqual(off.x, 324); XCTAssertEqual(off.y, 0)
-    }
-
-    // MARK: Offscreen snapshots
-
-    private var outDir: URL {
-        let dir = ProcessInfo.processInfo.environment["GLANCE_SNAPSHOT_DIR"].map { URL(fileURLWithPath: $0) }
-            ?? FileManager.default.temporaryDirectory.appendingPathComponent("glance-live-face")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
-    }
-
-    private func png(_ image: NSImage, to url: URL) throws {
-        guard let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
-              let data = rep.representation(using: .png, properties: [:]) else { throw XCTSkip("no png") }
-        try data.write(to: url)
-    }
-
-    func testRenderFaceSnapshots() throws {
-        let rig = FaceRig()
-        let size = CGSize(width: 420, height: 480)
-        let cases: [(String, HeadPose?)] = [
-            ("neutral", pose()),
-            ("yaw-right", pose(yaw: 0.55)),
-            ("pitch-up-roll", pose(pitch: 0.4, roll: 0.3)),
-            ("eyes-right-up", pose(eye: CGVector(dx: 0.9, dy: 0.6))),
-            ("blink", pose(open: 0)),
-            ("lean-close", pose(yaw: -0.3, center: CGPoint(x: 0.35, y: 0.55), size: 0.42)),
-        ]
-        var images: [NSImage] = []
-        for (name, p) in cases {
-            guard let img = rig.snapshot(size: size, angles: FaceMapping.angles(from: p)) else { throw XCTSkip("no Metal device") }
-            XCTAssertGreaterThan(img.size.width, 0)
-            try png(img, to: outDir.appendingPathComponent("face-\(name).png"))
-            images.append(img)
-        }
-        // Contact sheet: 3 x 2.
-        let sheet = NSImage(size: CGSize(width: size.width * 3, height: size.height * 2))
-        sheet.lockFocus()
-        NSColor(calibratedWhite: 0.93, alpha: 1).setFill(); NSRect(origin: .zero, size: sheet.size).fill()
-        for (i, img) in images.enumerated() {
-            let col = i % 3, row = 1 - i / 3
-            img.draw(in: NSRect(x: CGFloat(col) * size.width, y: CGFloat(row) * size.height, width: size.width, height: size.height))
-        }
-        sheet.unlockFocus()
-        try png(sheet, to: outDir.appendingPathComponent("face-sheet.png"))
     }
 
     func testMiniMapDrawsTheRealArrangementExactly() {
@@ -239,28 +173,41 @@ final class LiveFaceTests: XCTestCase {
         XCTAssertEqual(model.estimate, est)
     }
 
-    // MARK: Mini-map snapshot (SwiftUI Canvas, offscreen)
-
-    @MainActor func testRenderMiniMapSnapshot() throws {
+    /// Camera-rate updates must not rebuild the SwiftUI tree: only real changes are published.
+    func testModelPublishesOnlyWhenSomethingVisibleChanges() {
         let model = LiveFaceModel(hub: PoseHub())
-        model.displays = [Displays.Info(id: 1, frame: CGRect(x: 0, y: 0, width: 2560, height: 1440)),
-                          Displays.Info(id: 2, frame: CGRect(x: -1470, y: 0, width: 1470, height: 956))]
-        model.estimate = GazeEstimate(point: CGPoint(x: 1400, y: 500), displayID: 1, confidence: 0.84)
-        model.currentDisplay = 1
-        model.signals = FaceMapping.Signals(headX: 0.45, headY: -0.2, eyeX: 0.7, eyeY: 0.1)
-        model.mode = .both
-        let view = VStack(spacing: 10) {
-            MiniMapView(model: model).frame(height: 150)
-            VStack(spacing: 4) {
-                SignalBar(title: "Head ↔", value: model.signals.headX, tint: .blue)
-                SignalBar(title: "Eyes ↔", value: model.signals.eyeX, tint: .green)
-                SignalBar(title: "Head ↕", value: model.signals.headY, tint: .blue.opacity(0.6))
-                SignalBar(title: "Eyes ↕", value: model.signals.eyeY, tint: .green.opacity(0.6))
-            }
-        }.padding(14).frame(width: 380).background(Color.white)
-        let r = ImageRenderer(content: view)
-        r.scale = 2
-        guard let img = r.nsImage else { throw XCTSkip("no image") }
-        try png(img, to: outDir.appendingPathComponent("minimap.png"))
+        model.show()
+        var publishes = 0
+        let sub = model.objectWillChange.sink { publishes += 1 }
+        defer { sub.cancel(); model.hide() }
+        for i in 0..<45 {                                       // 3 s of tracking on one display
+            model.ingest(pose(yaw: 0.01 * Double(i), eye: CGVector(dx: 0.3, dy: 0)))
+            let est = GazeEstimate(point: CGPoint(x: 100 + i, y: 300), displayID: 1, confidence: 0.8)
+            model.update(state: SwitchEngine.State(estimate: est, currentDisplay: 1, hold: nil, paused: false))
+        }
+        XCTAssertLessThanOrEqual(publishes, 3)                  // face appeared, gaze on display 1, focus on 1
+        publishes = 0
+        let other = GazeEstimate(point: CGPoint(x: -500, y: 300), displayID: 2, confidence: 0.8)
+        model.update(state: SwitchEngine.State(estimate: other, currentDisplay: 1, hold: nil, paused: false))
+        XCTAssertEqual(publishes, 1)
+        XCTAssertEqual(model.gazeTarget, .display(2))
+    }
+
+    /// One dropped frame must not flash "No face"; a real loss shows after a short delay.
+    func testBriefFaceLossDoesNotFlicker() {
+        let model = LiveFaceModel(hub: PoseHub())
+        model.show()
+        defer { model.hide() }
+        model.ingest(pose())
+        XCTAssertTrue(model.faceVisible)
+        model.ingest(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        model.ingest(pose())
+        RunLoop.main.run(until: Date().addingTimeInterval(LiveFaceModel.lostDelay + 0.2))
+        XCTAssertTrue(model.faceVisible)
+        model.ingest(nil)
+        RunLoop.main.run(until: Date().addingTimeInterval(LiveFaceModel.lostDelay + 0.2))
+        XCTAssertFalse(model.faceVisible)
+        XCTAssertFalse(model.isIdle)                            // still easing to neutral
     }
 }
