@@ -137,6 +137,19 @@ final class LiveFaceTests: XCTestCase {
         try png(sheet, to: outDir.appendingPathComponent("face-sheet.png"))
     }
 
+    func testMiniMapDrawsTheRealArrangementExactly() {
+        // MacBook to the left of the external, tops aligned (CG coordinates, y down).
+        let ext = Displays.Info(id: 1, frame: CGRect(x: 0, y: 0, width: 2560, height: 1440))
+        let lap = Displays.Info(id: 2, frame: CGRect(x: -1470, y: 0, width: 1470, height: 956))
+        let m = MiniMapLayout(displays: [ext, lap], size: CGSize(width: 380, height: 200), padding: 12)
+        let re = m.rect(of: ext), rl = m.rect(of: lap)
+        XCTAssertEqual(rl.minY, re.minY, accuracy: 1e-9)                      // tops aligned
+        XCTAssertEqual(rl.maxX, re.minX, accuracy: 1e-9)                      // laptop touches the external's left edge
+        XCTAssertEqual(rl.width / re.width, 1470.0 / 2560.0, accuracy: 1e-9)  // same scale on both
+        XCTAssertEqual(rl.height / re.height, 956.0 / 1440.0, accuracy: 1e-9)
+        XCTAssertEqual(m.point(CGPoint(x: 0, y: 0)).x, re.minX, accuracy: 1e-9)
+    }
+
     // MARK: Settings
 
     func testRealOldSettingsJSONStillDecodesWithItsValues() throws {
@@ -231,7 +244,7 @@ final class LiveFaceTests: XCTestCase {
     @MainActor func testRenderMiniMapSnapshot() throws {
         let model = LiveFaceModel(hub: PoseHub())
         model.displays = [Displays.Info(id: 1, frame: CGRect(x: 0, y: 0, width: 2560, height: 1440)),
-                          Displays.Info(id: 2, frame: CGRect(x: -1512, y: 600, width: 1512, height: 982))]
+                          Displays.Info(id: 2, frame: CGRect(x: -1470, y: 0, width: 1470, height: 956))]
         model.estimate = GazeEstimate(point: CGPoint(x: 1400, y: 500), displayID: 1, confidence: 0.84)
         model.currentDisplay = 1
         model.signals = FaceMapping.Signals(headX: 0.45, headY: -0.2, eyeX: 0.7, eyeY: 0.1)

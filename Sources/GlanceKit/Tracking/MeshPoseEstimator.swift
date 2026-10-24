@@ -22,16 +22,15 @@ struct MeshModelPaths {
             dirs.append(r.appendingPathComponent("GlanceSwitch_GlanceKit.bundle/Models"))
             dirs.append(r.appendingPathComponent("Models"))
         }
-        // Last: SwiftPM's accessor traps if its bundle is missing, so only touch it after the packaged paths.
-        dirs.append(Bundle.module.resourceURL!.appendingPathComponent("Models"))
-        for d in dirs {
+        func find(_ d: URL) -> MeshModelPaths? {
             let a = d.appendingPathComponent("face_detector.onnx").path
             let b = d.appendingPathComponent("face_landmarks_detector.onnx").path
-            if FileManager.default.fileExists(atPath: a), FileManager.default.fileExists(atPath: b) {
-                return MeshModelPaths(detector: a, landmarks: b)
-            }
+            guard FileManager.default.fileExists(atPath: a), FileManager.default.fileExists(atPath: b) else { return nil }
+            return MeshModelPaths(detector: a, landmarks: b)
         }
-        return nil
+        for d in dirs { if let p = find(d) { return p } }
+        // Last: SwiftPM's accessor traps if its bundle is missing, so only touch it after the packaged paths.
+        return Bundle.module.resourceURL.flatMap { find($0.appendingPathComponent("Models")) }
     }
 }
 
