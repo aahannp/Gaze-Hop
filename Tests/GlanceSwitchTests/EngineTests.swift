@@ -2,6 +2,8 @@ import XCTest
 @testable import GlanceKit
 
 private final class FakeMapper: GazeMapper {
+    var gazeMode: GazeMode = .both
+    var eyeWeight: Double = 0.7
     var isCalibrated = true
     var next: GazeEstimate?
     var samples: [(HeadPose, CGPoint, Double)] = []

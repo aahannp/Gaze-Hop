@@ -25,12 +25,16 @@ public struct HeadPose: Equatable {
     public var faceSize: Double          // face bbox width / frame width (distance proxy, bigger = closer)
     public var eyeOffset: CGVector       // mean pupil offset inside eye boxes, -1...1, dx + = user's right, dy + = up
     public var confidence: Double        // 0...1
+    /// 0 = eyes closed (blink), 1 = fully open. Trackers that can't measure it leave 1.
+    /// While it is low, `eyeOffset` is unreliable and consumers should hold the last eye value.
+    public var eyeOpenness: Double
 
     public init(timestamp: TimeInterval, yaw: Double, pitch: Double, roll: Double,
-                faceCenter: CGPoint, faceSize: Double, eyeOffset: CGVector, confidence: Double) {
+                faceCenter: CGPoint, faceSize: Double, eyeOffset: CGVector, confidence: Double,
+                eyeOpenness: Double = 1) {
         self.timestamp = timestamp; self.yaw = yaw; self.pitch = pitch; self.roll = roll
         self.faceCenter = faceCenter; self.faceSize = faceSize; self.eyeOffset = eyeOffset
-        self.confidence = confidence
+        self.confidence = confidence; self.eyeOpenness = eyeOpenness
     }
 
     /// Feature vector the mapper regresses on. Order is part of the contract.
@@ -102,6 +106,16 @@ public protocol GazeMapper: AnyObject {
     func recordClickOutcome(predicted: DisplayID?, actual: DisplayID)
     /// 0...1, high when recent predictions keep missing => suggest recalibration.
     var driftScore: Double { get }
+    /// Which signal decides where the user looks (from Settings; the app keeps these in sync).
+    var gazeMode: GazeMode { get set }
+    /// 0...1, share of the decision given to the eyes when `gazeMode == .both` (1 = eyes only).
+    var eyeWeight: Double { get set }
+}
+
+/// Head only: turn your head to switch. Eyes only: move your eyes (head pose is still used to
+/// compensate, but never decides on its own). Both: blend, weighted by `Settings.eyeWeight`.
+public enum GazeMode: String, Codable, CaseIterable {
+    case head, eyes, both
 }
 
 /// Full-screen dot calibration UI. Implemented by `CalibrationController`.
@@ -158,7 +172,31 @@ public struct Settings: Codable, Equatable {
     public var learnFromClicks: Bool = true
     public var paneClickFallback: Bool = true
     public var paused: Bool = false
+    public var gazeMode: GazeMode = .both
+    public var eyeWeight: Double = 0.7            // used when gazeMode == .both; 1 = all eyes
     public init() {}
+
+    // Missing keys keep their defaults, so settings saved by an older build still load
+    // (the synthesized decoder would throw and wipe the user's choices).
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = Settings()
+        switchDelayMs = try c.decodeIfPresent(Double.self, forKey: .switchDelayMs) ?? d.switchDelayMs
+        headTurnThreshold = try c.decodeIfPresent(Double.self, forKey: .headTurnThreshold) ?? d.headTurnThreshold
+        windowFocusEnabled = try c.decodeIfPresent(Bool.self, forKey: .windowFocusEnabled) ?? d.windowFocusEnabled
+        paneDelayMs = try c.decodeIfPresent(Double.self, forKey: .paneDelayMs) ?? d.paneDelayMs
+        typingProtection = try c.decodeIfPresent(Bool.self, forKey: .typingProtection) ?? d.typingProtection
+        typingPauseSec = try c.decodeIfPresent(Double.self, forKey: .typingPauseSec) ?? d.typingPauseSec
+        mousePriorityMs = try c.decodeIfPresent(Double.self, forKey: .mousePriorityMs) ?? d.mousePriorityMs
+        movePointer = try c.decodeIfPresent(Bool.self, forKey: .movePointer) ?? d.movePointer
+        showGazeDot = try c.decodeIfPresent(Bool.self, forKey: .showGazeDot) ?? d.showGazeDot
+        cameraID = try c.decodeIfPresent(String.self, forKey: .cameraID) ?? d.cameraID
+        learnFromClicks = try c.decodeIfPresent(Bool.self, forKey: .learnFromClicks) ?? d.learnFromClicks
+        paneClickFallback = try c.decodeIfPresent(Bool.self, forKey: .paneClickFallback) ?? d.paneClickFallback
+        paused = try c.decodeIfPresent(Bool.self, forKey: .paused) ?? d.paused
+        gazeMode = try c.decodeIfPresent(GazeMode.self, forKey: .gazeMode) ?? d.gazeMode
+        eyeWeight = try c.decodeIfPresent(Double.self, forKey: .eyeWeight) ?? d.eyeWeight
+    }
 }
 
 // MARK: - Displays helper

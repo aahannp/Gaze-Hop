@@ -398,6 +398,9 @@ public final class RegressionGazeMapper: GazeMapper {
     public var sampleCount: Int { lock.lock(); defer { lock.unlock() }; _ = syncToCurrent(); return calibration.count + clicks.count }
 
     public var driftScore: Double { lock.lock(); defer { lock.unlock() }; return drift }
+    // TODO(calibration worker): honour these in estimate(); for now the mapper ignores them.
+    public var gazeMode: GazeMode = .both
+    public var eyeWeight: Double = 0.7
 
     public func estimate(_ pose: HeadPose, currentDisplay: DisplayID?, edgeBias: Double) -> GazeEstimate? {
         estimate(pose, currentDisplay: currentDisplay, edgeBias: edgeBias, displays: displaysProvider())
