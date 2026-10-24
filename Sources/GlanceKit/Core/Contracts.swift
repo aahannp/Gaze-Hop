@@ -150,7 +150,7 @@ public struct Settings: Codable, Equatable {
     public var windowFocusEnabled: Bool = true    // windows / panes on the same display
     public var paneDelayMs: Double = 300
     public var typingProtection: Bool = true
-    public var typingPauseSec: Double = 0.8
+    public var typingPauseSec: Double = 0.5
     public var mousePriorityMs: Double = 600
     public var movePointer: Bool = true
     public var showGazeDot: Bool = false

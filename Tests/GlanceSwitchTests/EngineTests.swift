@@ -74,6 +74,7 @@ final class EngineTests: XCTestCase {
                               displayAt: { [unowned self] p in self.frames.first { $0.value.contains(p) }?.key },
                               schedule: { [unowned self] _, b in self.scheduled.append(b) },
                               latencyLog: fakeLog)
+        engine.fastFrames = .max   // fast path off for the dwell tests; enabled explicitly below
     }
 
     private func pose() -> HeadPose {
@@ -253,7 +254,7 @@ final class EngineTests: XCTestCase {
     func testNewDefaultsAreSnappy() {
         let d = Settings()
         XCTAssertEqual(d.switchDelayMs, 150)
-        XCTAssertEqual(d.typingPauseSec, 0.8)
+        XCTAssertEqual(d.typingPauseSec, 0.5)
         XCTAssertEqual(d.mousePriorityMs, 600)
     }
 
@@ -318,4 +319,115 @@ final class EngineTests: XCTestCase {
         gaze(2, CGPoint(x: 1500, y: 400), for: 0.5)
         XCTAssertTrue(fakeLog.lines.isEmpty)
     }
+
+    // MARK: fast path / anti-flicker / miss logging
+
+    private func noFace(for seconds: Double) {
+        let end = clock + seconds
+        while clock < end { engine.handle(pose: nil); clock += 0.066 }
+        engine.handle(pose: nil)
+    }
+
+    private func lines(_ prefix: String) -> [String] { fakeLog.lines.filter { $0.hasPrefix(prefix) } }
+
+    func testFastPathSwitchesAfterTwoDecisiveFrames() {
+        engine.fastFrames = 2
+        mapper.next = GazeEstimate(point: CGPoint(x: 1500, y: 400), displayID: 2, confidence: 0.9)
+        engine.handle(pose: pose()); clock += 0.066
+        XCTAssertTrue(focus.displayCalls.isEmpty)             // one frame is not enough
+        engine.handle(pose: pose())
+        XCTAssertEqual(focus.displayCalls.count, 1)
+        XCTAssertTrue(lines("switch").first?.contains("fast=1") == true, "\(fakeLog.lines)")
+    }
+
+    func testNearEdgeKeepsFullDwell() {
+        engine.fastFrames = 2
+        gaze(2, CGPoint(x: 1050, y: 400), for: 0.2)           // 50 px past the edge < 12% of 1000
+        XCTAssertTrue(focus.displayCalls.isEmpty)
+        gaze(2, CGPoint(x: 1050, y: 400), for: 0.2)
+        XCTAssertEqual(focus.displayCalls.count, 1)
+        XCTAssertTrue(lines("switch").first?.contains("fast=0") == true)
+    }
+
+    func testLowConfidenceSkipsFastPath() {
+        engine.fastFrames = 2
+        mapper.next = GazeEstimate(point: CGPoint(x: 1500, y: 400), displayID: 2, confidence: 0.3)
+        for _ in 0..<3 { engine.handle(pose: pose()); clock += 0.066 }
+        XCTAssertTrue(focus.displayCalls.isEmpty)
+    }
+
+    func testAntiFlickerNeedsFullDwellToGoBack() {
+        engine.fastFrames = 2
+        gaze(2, CGPoint(x: 1500, y: 400), for: 0.1)
+        XCTAssertEqual(focus.displayCalls.count, 1)
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.15)           // decisive, but within 0.5 s of the switch
+        XCTAssertEqual(focus.displayCalls.count, 1)
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.3)            // full dwell elapses
+        XCTAssertEqual(focus.displayCalls.count, 2)
+        XCTAssertTrue(lines("switch").last?.contains("fast=0") == true)
+    }
+
+    func testFastPathAllowedAgainAfterFlickerWindow() {
+        engine.fastFrames = 2
+        gaze(2, CGPoint(x: 1500, y: 400), for: 0.1)
+        clock += 0.6
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.1)
+        XCTAssertEqual(focus.displayCalls.count, 2)
+        XCTAssertTrue(lines("switch").last?.contains("fast=1") == true)
+    }
+
+    func testMissLoggedWhenGazeReturns() {
+        gaze(2, CGPoint(x: 1050, y: 400), for: 0.2)
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.1)
+        let miss = lines("miss")
+        XCTAssertEqual(miss.count, 1, "\(fakeLog.lines)")
+        XCTAssertTrue(miss[0].contains("display=2") && miss[0].contains("reason=returned"), miss[0])
+    }
+
+    func testNoMissLoggedForShortPending() {
+        gaze(2, CGPoint(x: 1050, y: 400), for: 0.05)
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.1)
+        XCTAssertTrue(lines("miss").isEmpty)
+    }
+
+    func testMissReasons() {
+        gaze(2, CGPoint(x: 1050, y: 400), for: 0.2)
+        gaze(nil, CGPoint(x: 1000, y: -50), for: 0.4)
+        XCTAssertTrue(lines("miss").last?.contains("reason=offscreen") == true, "\(fakeLog.lines)")
+        gaze(2, CGPoint(x: 1050, y: 400), for: 0.2)
+        noFace(for: 0.1)
+        XCTAssertTrue(lines("miss").last?.contains("reason=faceLost") == true, "\(fakeLog.lines)")
+        input.lastKeyTime = clock
+        gaze(2, CGPoint(x: 1050, y: 400), for: 0.5)           // dwell done but typing-held
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.1)
+        XCTAssertTrue(lines("miss").last?.contains("reason=hold") == true, "\(fakeLog.lines)")
+        XCTAssertTrue(lines("miss").last?.contains("hold=typing") == true)
+    }
+
+    func testFaceLostSpanLogged() {
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.1)
+        noFace(for: 0.5)
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.1)
+        XCTAssertEqual(lines("faceLost").count, 1, "\(fakeLog.lines)")
+    }
+
+    func testShortFaceLostNotLogged() {
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.1)
+        noFace(for: 0.15)
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.1)
+        XCTAssertTrue(lines("faceLost").isEmpty)
+    }
+
+    func testPeriodicSummary() {
+        engine.summaryInterval = 1
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.5)
+        noFace(for: 0.3)
+        gaze(nil, CGPoint(x: 500, y: -900), for: 0.4)
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.5)
+        let sum = lines("summary")
+        XCTAssertEqual(sum.count, 1, "\(fakeLog.lines)")
+        XCTAssertTrue(sum[0].contains("noFace=") && sum[0].contains("offScreen=") && sum[0].contains("meanConf=1.00"), sum[0])
+    }
+
+    func testTypingPauseDefault() { XCTAssertEqual(Settings().typingPauseSec, 0.5) }
 }
