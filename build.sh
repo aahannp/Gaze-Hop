@@ -115,3 +115,17 @@ if [[ "${1:-}" == "install" ]]; then
   echo "==> installed to ~/Applications/$APP_NAME.app"
   open ~/Applications/$APP_NAME.app
 fi
+
+if [[ "${1:-}" == "dmg" ]]; then
+  # Drag-to-install disk image: the signed app + an /Applications shortcut. Built in the staging dir (not iCloud).
+  VERSION="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$SAPP/Contents/Info.plist" 2>/dev/null || echo 1.0)"
+  DMG_SRC="$STAGE/dmg"; DMG_OUT="$STAGE/$APP_NAME-$VERSION.dmg"
+  mkdir -p "$DMG_SRC"
+  "${COPY[@]}" "$SAPP" "$DMG_SRC/$APP_NAME.app"
+  ln -s /Applications "$DMG_SRC/Applications"
+  hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$DMG_SRC" -fs HFS+ -format UDZO -ov "$DMG_OUT"
+  if [[ -n "$IDENTITY" ]]; then codesign --force --sign "$IDENTITY" "$DMG_OUT"; fi
+  hdiutil verify -quiet "$DMG_OUT"
+  "${COPY[@]}" "$DMG_OUT" "build/$APP_NAME-$VERSION.dmg"
+  echo "==> dmg build/$APP_NAME-$VERSION.dmg"
+fi
