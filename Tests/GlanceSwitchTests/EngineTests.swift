@@ -84,8 +84,10 @@ final class EngineTests: XCTestCase {
         engine.fastFrames = .max   // fast path off for the dwell tests; enabled explicitly below
     }
 
+    private var yaw = 0.0
+
     private func pose() -> HeadPose {
-        HeadPose(timestamp: clock, yaw: 0, pitch: 0, roll: 0, faceCenter: .zero, faceSize: 0.3,
+        HeadPose(timestamp: clock, yaw: yaw, pitch: 0, roll: 0, faceCenter: .zero, faceSize: 0.3,
                  eyeOffset: .zero, confidence: 1)
     }
 
@@ -329,6 +331,12 @@ final class EngineTests: XCTestCase {
 
     // MARK: fast path / anti-flicker / miss logging
 
+    /// Head turn: one frame per 66 ms, yaw advancing by `step` each frame, estimate on `display` at `point`.
+    private func turn(_ display: DisplayID?, _ point: CGPoint, step: Double, frames: Int, conf: Double = 0.9) {
+        mapper.next = GazeEstimate(point: point, displayID: display, confidence: conf)
+        for _ in 0..<frames { yaw += step; engine.handle(pose: pose()); clock += 0.066 }
+    }
+
     private func noFace(for seconds: Double) {
         let end = clock + seconds
         while clock < end { engine.handle(pose: nil); clock += 0.066 }
@@ -337,14 +345,45 @@ final class EngineTests: XCTestCase {
 
     private func lines(_ prefix: String) -> [String] { fakeLog.lines.filter { $0.hasPrefix(prefix) } }
 
-    func testFastPathSwitchesAfterTwoDecisiveFrames() {
+    func testFastPathSwitchesAfterTwoDecisiveFramesWhileTurning() {
         engine.fastFrames = 2
-        mapper.next = GazeEstimate(point: CGPoint(x: 1500, y: 400), displayID: 2, confidence: 0.9)
-        engine.handle(pose: pose()); clock += 0.066
-        XCTAssertTrue(focus.displayCalls.isEmpty)             // one frame is not enough
-        engine.handle(pose: pose())
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.4)             // steady on display 1, yaw 0
+        turn(2, CGPoint(x: 1500, y: 400), step: 0.08, frames: 1)
+        XCTAssertTrue(focus.displayCalls.isEmpty)              // one frame is not enough
+        turn(2, CGPoint(x: 1500, y: 400), step: 0.08, frames: 1)
         XCTAssertEqual(focus.displayCalls.count, 1)
         XCTAssertTrue(lines("switch").first?.contains("fast=1") == true, "\(fakeLog.lines)")
+    }
+
+    func testFastPathNeedsYawMotion() {
+        engine.fastFrames = 2
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.4)
+        gaze(2, CGPoint(x: 1500, y: 400), for: 0.25)           // decisive + confident, but yaw never moves
+        XCTAssertTrue(focus.displayCalls.isEmpty)
+        gaze(2, CGPoint(x: 1500, y: 400), for: 0.15)           // full dwell still switches
+        XCTAssertEqual(focus.displayCalls.count, 1)
+        XCTAssertTrue(lines("switch").first?.contains("fast=0") == true)
+    }
+
+    func testFastPathRejectsYawMovingAwayFromTarget() {
+        engine.fastFrames = 2
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.4)
+        turn(2, CGPoint(x: 1500, y: 400), step: -0.08, frames: 3)   // turning left, target is right
+        XCTAssertTrue(focus.displayCalls.isEmpty)
+    }
+
+    func testLookingDownPitchOnlyNeverTakesFastPath() {
+        engine.fastFrames = 2
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.4)
+        mapper.next = GazeEstimate(point: CGPoint(x: 1500, y: 400), displayID: 2, confidence: 0.95)
+        var pitch = 0.0
+        for _ in 0..<3 {
+            pitch -= 0.08
+            engine.handle(pose: HeadPose(timestamp: clock, yaw: 0, pitch: pitch, roll: 0, faceCenter: .zero,
+                                         faceSize: 0.3, eyeOffset: .zero, confidence: 1))
+            clock += 0.066
+        }
+        XCTAssertTrue(focus.displayCalls.isEmpty)
     }
 
     func testNearEdgeKeepsFullDwell() {
@@ -365,22 +404,24 @@ final class EngineTests: XCTestCase {
 
     func testAntiFlickerNeedsFullDwellToGoBack() {
         engine.fastFrames = 2
-        gaze(2, CGPoint(x: 1500, y: 400), for: 0.1)
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.4)
+        turn(2, CGPoint(x: 1500, y: 400), step: 0.08, frames: 2)
         XCTAssertEqual(focus.displayCalls.count, 1)
-        gaze(1, CGPoint(x: 500, y: 400), for: 0.15)           // decisive, but within 0.5 s of the switch
+        turn(1, CGPoint(x: 500, y: 400), step: -0.1, frames: 3)    // decisive turn back, < 0.5 s after the switch
         XCTAssertEqual(focus.displayCalls.count, 1)
-        gaze(1, CGPoint(x: 500, y: 400), for: 0.3)            // full dwell elapses
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.35)                 // full dwell elapses
         XCTAssertEqual(focus.displayCalls.count, 2)
         XCTAssertTrue(lines("switch").last?.contains("fast=0") == true)
     }
 
     func testFastPathAllowedAgainAfterFlickerWindow() {
         engine.fastFrames = 2
-        gaze(2, CGPoint(x: 1500, y: 400), for: 0.1)
-        clock += 0.6
-        gaze(1, CGPoint(x: 500, y: 400), for: 0.1)
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.4)
+        turn(2, CGPoint(x: 1500, y: 400), step: 0.08, frames: 2)
+        gaze(2, CGPoint(x: 1500, y: 400), for: 0.7)
+        turn(1, CGPoint(x: 500, y: 400), step: -0.08, frames: 3)
         XCTAssertEqual(focus.displayCalls.count, 2)
-        XCTAssertTrue(lines("switch").last?.contains("fast=1") == true)
+        XCTAssertTrue(lines("switch").last?.contains("fast=1") == true, "\(fakeLog.lines)")
     }
 
     func testMissLoggedWhenGazeReturns() {
@@ -477,5 +518,63 @@ final class EngineTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: rotated.path))
         XCTAssertTrue(try String(contentsOf: rotated).hasPrefix(TraceLog.header))
         XCTAssertLessThan(try Data(contentsOf: url).count, 4_000)
+    }
+
+    // MARK: false-jump safeguards (looking down at the keyboard)
+
+    func testHoldDoesNotAccumulateDwell() {
+        input.lastKeyTime = clock                           // typing hold 2 s (pinned)
+        gaze(2, CGPoint(x: 1050, y: 400), for: 2.05)        // dwell (0.3) would long be met without the hold
+        XCTAssertTrue(focus.displayCalls.isEmpty)
+        gaze(2, CGPoint(x: 1050, y: 400), for: 0.1)         // dwell restarted when the hold ended
+        XCTAssertTrue(focus.displayCalls.isEmpty)
+        gaze(2, CGPoint(x: 1050, y: 400), for: 0.4)
+        XCTAssertEqual(focus.displayCalls.count, 1)
+    }
+
+    func testTypingThenLookingDownNeverSwitches() {
+        settings.typingPauseSec = 0.5
+        engine.fastFrames = 2
+        // Typing for ~3.9 s while the pose reads as the laptop (looking down at the keyboard).
+        var typed = 0.0
+        while typed < 3.9 {
+            input.lastKeyTime = clock
+            gaze(2, CGPoint(x: 1500, y: 400), for: 0.3)
+            typed += 0.3
+        }
+        XCTAssertTrue(focus.displayCalls.isEmpty, "no switch while typing")
+        // Typing stops: the hold ends after 0.5 s and the dwell restarts then (0.3 s, no fast path).
+        gaze(2, CGPoint(x: 1500, y: 400), for: 0.15)
+        XCTAssertTrue(focus.displayCalls.isEmpty, "must not switch the instant typing stops")
+        gaze(2, CGPoint(x: 1500, y: 400), for: 0.6)
+        XCTAssertEqual(focus.displayCalls.count, 1)
+        XCTAssertTrue(lines("switch").first?.contains("fast=0") == true)
+        XCTAssertTrue(lines("switch").first?.contains("hold=typing") == true)
+    }
+
+    func testNoFastPathRightAfterTypingEvenWhenTurning() {
+        settings.typingPauseSec = 0.1
+        engine.fastFrames = 2
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.2)
+        input.lastKeyTime = clock
+        gaze(1, CGPoint(x: 500, y: 400), for: 0.3)           // hold over, still < 1.5 s since the key
+        turn(2, CGPoint(x: 1500, y: 400), step: 0.1, frames: 4)
+        XCTAssertTrue(focus.displayCalls.isEmpty)
+    }
+
+    func testPostTypingGapFrameResetsDwellWithoutGrace() {
+        settings.typingPauseSec = 0.1
+        input.lastKeyTime = clock
+        gaze(2, CGPoint(x: 1050, y: 400), for: 0.2)          // hold ends ~0.1 s, dwell restarts
+        gaze(nil, CGPoint(x: 1000, y: -50), for: 0.07)       // a brief gap (inside the normal 0.15 s grace)
+        gaze(2, CGPoint(x: 1050, y: 400), for: 0.2)
+        XCTAssertTrue(focus.displayCalls.isEmpty)
+    }
+
+    func testGapWithinGraceStillAllowedWhenNotAfterTyping() {
+        gaze(2, CGPoint(x: 1050, y: 400), for: 0.2)
+        gaze(nil, CGPoint(x: 1000, y: -50), for: 0.07)
+        gaze(2, CGPoint(x: 1050, y: 400), for: 0.2)
+        XCTAssertEqual(focus.displayCalls.count, 1)
     }
 }

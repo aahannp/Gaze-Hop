@@ -39,8 +39,15 @@ public final class SwitchEngine {
     /// How often to ask the focus controller which display is focused while the mouse is active.
     public var focusQueryInterval: TimeInterval = 0.25
     // Fast path: switch after `fastFrames` consecutive decisive frames instead of the full dwell.
-    public var decisiveFraction = 0.12        // of the target display's width, beyond the shared edge
-    public var fastMinConfidence = 0.6
+    public var decisiveFraction = 0.2         // of the target display's width, beyond the shared edge
+    public var fastMinConfidence = 0.75
+    /// Fast path also needs the head to be turning toward the target: at least this much yaw
+    /// (pitch for vertically stacked displays) in the last `motionWindow`. A static pose — e.g.
+    /// looking down at the keyboard — never qualifies.
+    public var minTurnMotion = 0.04           // radians
+    public var motionWindow: TimeInterval = 0.3
+    /// Within this long after the last key, switching needs the full dwell with no gap frames.
+    public var postTypingStrict: TimeInterval = 1.5
     public var fastFrames = 2
     public var flickerWindow: TimeInterval = 0.5   // after a switch, going back needs the full dwell
     // Diagnostics
@@ -57,6 +64,12 @@ public final class SwitchEngine {
     private var candidatePoseTime: TimeInterval = 0   // pose.timestamp when the gaze first left the current display
     private var offScreenSince: TimeInterval?
     private var decisiveFrames = 0
+    private var candidateFirstSeen: TimeInterval = 0
+    private var candidateAfterHold = false
+    private var candidateStrict = false
+    private var heldSince: TimeInterval?
+    private var heldUntil: TimeInterval = 0
+    private var poseHistory: [(t: TimeInterval, yaw: Double, pitch: Double)] = []
     private var lastSwitchAt: TimeInterval = -.infinity
     private var faceLostSince: TimeInterval?
     private var statStart: TimeInterval?
@@ -129,6 +142,8 @@ public final class SwitchEngine {
             return
         }
         latestPose = pose; latestPoseAt = t
+        poseHistory.append((t, pose.yaw, pose.pitch))
+        poseHistory.removeAll { t - $0.t > 0.6 }
 
         if currentDisplay == nil { currentDisplay = focus.focusedDisplay() }
         let mouseActive = input.lastMouseTime > 0 && t - input.lastMouseTime < s.mousePriorityMs / 1000
@@ -153,7 +168,7 @@ public final class SwitchEngine {
             if candidateDisplay != nil {
                 let since = offScreenSince ?? t
                 offScreenSince = since
-                if t - since > offScreenGrace { clearCandidate("offscreen") }
+                if candidateStrict || t - since > offScreenGrace { clearCandidate("offscreen") }
             }
             publish(estimate: est, hold: nil)
             return
@@ -165,22 +180,30 @@ public final class SwitchEngine {
             paneCandidate = nil
             if candidateDisplay != display {
                 clearCandidate("returned")
-                candidateDisplay = display; candidateSince = t; candidatePoseTime = pose.timestamp
-                decisiveFrames = 0
+                candidateDisplay = display; candidateSince = t; candidateFirstSeen = t
+                candidatePoseTime = pose.timestamp
             }
-            decisiveFrames = isDecisive(est, display: display) ? decisiveFrames + 1 : 0
-            // Anti-flicker: right after a switch, going back needs the full dwell.
-            let flickerGuard = t - lastSwitchAt < flickerWindow
-            let fast = !flickerGuard && decisiveFrames >= fastFrames
-            if fast || t - candidateSince >= s.switchDelayMs / 1000 {
-                if dwellDoneAt == nil { dwellDoneAt = t }
-                if let h = hold { holdSeen = h }
-                else {
+            if s.typingProtection, input.lastKeyTime > 0, t - input.lastKeyTime < postTypingStrict {
+                candidateStrict = true     // looking down at the keyboard reads as another display
+            }
+            if let h = hold {
+                // No dwell accumulates under a hold; it restarts when the hold ends, without the fast path.
+                if heldSince == nil { heldSince = t }
+                heldUntil = t; holdSeen = h
+                candidateSince = t; decisiveFrames = 0; candidateAfterHold = true
+            } else {
+                decisiveFrames = isDecisive(est, display: display) && isTurning(toward: display, at: t)
+                    ? decisiveFrames + 1 : 0
+                // Anti-flicker: right after a switch, going back needs the full dwell.
+                let flickerGuard = t - lastSwitchAt < flickerWindow
+                let fast = !flickerGuard && !candidateAfterHold && !candidateStrict && decisiveFrames >= fastFrames
+                let dwellMet = t - candidateSince >= s.switchDelayMs / 1000
+                if fast || dwellMet {
                     let focusStart = now()
                     focus.focusDisplay(display, gazePoint: est.point, movePointer: s.movePointer)
-                    logSwitch(to: display, pose: pose, dwellDone: dwellDoneAt ?? t, switchedAt: focusStart,
+                    logSwitch(to: display, pose: pose, dwellDone: t, switchedAt: focusStart,
                               focusDuration: now() - focusStart, poseAge: t - pose.timestamp,
-                              fast: fast && t - candidateSince < s.switchDelayMs / 1000)
+                              fast: fast && !dwellMet)
                     currentDisplay = display
                     cachedFocused = display; lastFocusQuery = t   // don't let a stale cache revert us
                     lastSwitchAt = t
@@ -206,10 +229,24 @@ public final class SwitchEngine {
         return hypot(dx, dy) >= decisiveFraction * frame.width
     }
 
+    /// Head moving toward `display` over the last `motionWindow` (yaw for side-by-side displays,
+    /// pitch for stacked ones). Needs real history: a pose that has been static never qualifies.
+    private func isTurning(toward display: DisplayID, at t: TimeInterval) -> Bool {
+        guard let cur = currentDisplay, let c = displayFrame(cur), let d = displayFrame(display),
+              let latest = poseHistory.last,
+              let ref = poseHistory.first(where: { t - $0.t <= motionWindow + 0.05 }),
+              latest.t - ref.t >= motionWindow * 0.6 else { return false }
+        let dx = d.midX - c.midX, dy = d.midY - c.midY
+        let delta = abs(dx) >= abs(dy)
+            ? (latest.yaw - ref.yaw) * (dx >= 0 ? 1 : -1)        // + yaw = user's right
+            : (latest.pitch - ref.pitch) * (dy < 0 ? 1 : -1)     // + pitch = up; CG y grows down
+        return delta >= minTurnMotion
+    }
+
     /// Drops the pending candidate. A non-nil `reason` logs a `miss` if it had been pending >= 100 ms.
     private func clearCandidate(_ reason: String? = nil) {
         if let cand = candidateDisplay, let reason, let log = latencyLog, log.isEnabled {
-            let pending = now() - candidateSince
+            let pending = now() - candidateFirstSeen
             if pending >= missLogThreshold {
                 let why = holdSeen != nil ? "hold" : reason
                 let holdText = holdSeen.map { $0 == .typing ? "typing" : "mouse" } ?? "none"
@@ -217,6 +254,7 @@ public final class SwitchEngine {
             }
         }
         candidateDisplay = nil; offScreenSince = nil; dwellDoneAt = nil; holdSeen = nil; decisiveFrames = 0
+        candidateAfterHold = false; candidateStrict = false; heldSince = nil
     }
 
     // MARK: Diagnostics
@@ -278,9 +316,9 @@ public final class SwitchEngine {
                            focusDuration: TimeInterval, poseAge: TimeInterval, fast: Bool) {
         guard let log = latencyLog, log.isEnabled else { return }
         func ms(_ x: TimeInterval) -> String { String(format: "%.0f", x * 1000) }
-        let holdText = holdSeen.map { "\($0 == .typing ? "typing" : "mouse") \(ms(switchedAt - dwellDone))ms" } ?? "none"
+        let holdText = holdSeen.map { "\($0 == .typing ? "typing" : "mouse") \(ms(heldUntil - (heldSince ?? heldUntil)))ms" } ?? "none"
         log.log("switch display=\(display) leftAt=\(String(format: "%.3f", candidatePoseTime)) "
-                + "dwellDoneAt=\(String(format: "%.3f", dwellDone)) dwell=\(ms(dwellDone - candidateSince))ms "
+                + "dwellDoneAt=\(String(format: "%.3f", dwellDone)) dwell=\(ms(dwellDone - candidateSince))ms pending=\(ms(dwellDone - candidateFirstSeen))ms "
                 + "poseAge=\(ms(poseAge))ms hold=\(holdText) focus=\(ms(focusDuration))ms "
                 + "total=\(ms(switchedAt + focusDuration - candidatePoseTime))ms fast=\(fast ? 1 : 0)")
     }
