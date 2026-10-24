@@ -162,3 +162,94 @@ final class CalibrationMapperTests: XCTestCase {
         XCTAssertEqual(m.sampleCount, base + RegressionGazeMapper.maxClickSamples)
     }
 }
+
+final class CalibrationProfileTests: XCTestCase {
+    /// Trains a mapper on `displays` (a fake gaze centred on the desktop) and returns it.
+    func train(_ m: RegressionGazeMapper, displays: [Displays.Info]) {
+        var rng = SplitMix(s: 11)
+        let b = displays.map { $0.frame }.reduce(CGRect.null) { $0.union($1) }
+        for d in displays { for gx in 0..<4 { for gy in 0..<4 { for size in [0.25, 0.35] {
+            let t = CGPoint(x: d.frame.minX + d.frame.width * (0.05 + 0.3 * Double(gx)),
+                            y: d.frame.minY + d.frame.height * (0.05 + 0.3 * Double(gy)))
+            let k = size / 0.3
+            let yaw = Double(t.x - b.midX) / (4500 * k), pitch = -Double(t.y - b.midY) / (3000 * k)
+            m.addSample(HeadPose(timestamp: 0, yaw: yaw, pitch: pitch, roll: 0, faceCenter: CGPoint(x: 0.5, y: 0.5),
+                                 faceSize: size, eyeOffset: .zero, confidence: 1), target: t, weight: 1)
+            _ = rng.next()
+        } } } }
+        XCTAssertTrue(m.fit())
+    }
+
+    func testProfilesSwitchWithArrangement() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("glance-prof-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let home = FakeGaze.both
+        let office = [Displays.Info(id: 9, frame: CGRect(x: 0, y: 0, width: 1920, height: 1080))]
+        var current = home
+        let m = RegressionGazeMapper(url: url, displays: { current })
+        train(m, displays: home)
+        XCTAssertTrue(m.isCalibrated)
+
+        current = office
+        XCTAssertFalse(m.isCalibrated, "no profile for the office arrangement yet")
+        train(m, displays: office)
+        XCTAssertTrue(m.isCalibrated)
+        XCTAssertEqual(m.profileCount, 2)
+        try m.save()
+
+        // Fresh mapper: load picks the profile for whatever is plugged in now.
+        let m2 = RegressionGazeMapper(url: url, displays: { current })
+        try m2.load(); XCTAssertTrue(m2.isCalibrated)
+        current = home
+        XCTAssertTrue(m2.isCalibrated, "home profile restored automatically")
+        current = [Displays.Info(id: 77, frame: CGRect(x: 0, y: 0, width: 800, height: 600))]
+        XCTAssertFalse(m2.isCalibrated)
+
+        // reset() clears only the current arrangement's profile.
+        current = office
+        m2.reset(); XCTAssertFalse(m2.isCalibrated)
+        current = home
+        XCTAssertTrue(m2.isCalibrated)
+        try m2.save()
+        let m3 = RegressionGazeMapper(url: url, displays: { office })
+        try m3.load(); XCTAssertFalse(m3.isCalibrated)
+    }
+
+    func testV1FileMigrates() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("glance-v1-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let m = RegressionGazeMapper(url: url, displays: { FakeGaze.both })
+        train(m, displays: FakeGaze.both)
+        try m.save()
+        // Rewrite the saved profile in the old single-calibration layout.
+        let blob = try JSONDecoder().decode(RegressionGazeMapper.Persisted.self, from: Data(contentsOf: url))
+        let prof = blob.profiles.values.first!
+        var old = RegressionGazeMapper.Persisted(profiles: [:])
+        old.version = 1; old.arrangement = prof.arrangement; old.samples = prof.samples; old.model = prof.model
+        try JSONEncoder().encode(old).write(to: url)
+        let m2 = RegressionGazeMapper(url: url, displays: { FakeGaze.both })
+        try m2.load(); XCTAssertTrue(m2.isCalibrated)
+    }
+}
+
+final class CalibrationPlanTests: XCTestCase {
+    func testStepsAdaptToDisplays() {
+        let one = CalibrationController.makePlans(displays: [FakeGaze.A])
+        let s1 = CalibrationController.makeSteps(for: one[0])
+        XCTAssertEqual(s1.count, 5 + 9)      // 5 range prompts + 3x3 grid, no shared edges
+        XCTAssertTrue(s1.allSatisfy { FakeGaze.A.frame.contains($0.target) })
+
+        let two = CalibrationController.makePlans(displays: FakeGaze.both)
+        XCTAssertEqual(two.count, 2)
+        XCTAssertEqual(two[0].points.count, 9 + 3)   // extra points on the shared edge
+        // Edge points of display A sit near its right (shared) edge.
+        XCTAssertTrue(two[0].points.suffix(3).allSatisfy { $0.x > 2400 && $0.x < 2560 })
+
+        // Laptop below an external monitor (vertical neighbour).
+        let ext = Displays.Info(id: 5, frame: CGRect(x: 0, y: 0, width: 2560, height: 1440))
+        let lap = Displays.Info(id: 6, frame: CGRect(x: 500, y: 1440, width: 1440, height: 900))
+        let plans = CalibrationController.makePlans(displays: [ext, lap])
+        XCTAssertEqual(plans.map { $0.points.count }, [12, 12])
+        for p in plans { for s in CalibrationController.makeSteps(for: p) { XCTAssertTrue(p.display.frame.contains(s.target)) } }
+    }
+}

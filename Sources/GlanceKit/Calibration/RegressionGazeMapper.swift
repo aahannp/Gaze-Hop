@@ -165,10 +165,18 @@ enum DisplayResolver {
 public final class RegressionGazeMapper: GazeMapper {
     struct StoredSample: Codable { var f: [Double]; var x: Double; var y: Double; var w: Double; var click: Bool }
     struct StoredDisplay: Codable, Equatable { var id: UInt32; var x: Double; var y: Double; var w: Double; var h: Double }
-    struct Persisted: Codable {
-        var version = 1
+    /// One calibration for one display arrangement.
+    struct Profile: Codable {
         var arrangement: [StoredDisplay]
         var samples: [StoredSample]
+        var model: GazeModel?
+    }
+    struct Persisted: Codable {
+        var version = 2
+        var profiles: [String: Profile] = [:]
+        // v1 (single calibration) fields, read for migration only.
+        var arrangement: [StoredDisplay]?
+        var samples: [StoredSample]?
         var model: GazeModel?
     }
 
@@ -186,10 +194,12 @@ public final class RegressionGazeMapper: GazeMapper {
     private let lock = NSLock()
     private let url: URL
     private let displaysProvider: () -> [Displays.Info]
+    /// Every known profile except the active one's live edits, which sit in the fields below.
+    private var profiles: [String: Profile] = [:]
+    private var activeSignature: String?
     private var calibration: [StoredSample] = []
     private var clicks: [StoredSample] = []     // bounded rolling buffer, oldest dropped first
     private var model: GazeModel?
-    private var arrangement: [StoredDisplay] = []
     private var drift = 0.0
     private var clicksSinceFit = 0
 
@@ -204,12 +214,52 @@ public final class RegressionGazeMapper: GazeMapper {
             .sorted { $0.id < $1.id }
     }
 
-    public var isCalibrated: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return model != nil && arrangement == Self.arrangement(of: displaysProvider())
+    /// Stable key for a display arrangement (ids, sizes, positions).
+    static func signature(of d: [Displays.Info]) -> String {
+        arrangement(of: d).sorted { $0.id < $1.id }.map { "\($0.id):\(Int($0.x.rounded())),\(Int($0.y.rounded())),\(Int($0.w.rounded()))x\(Int($0.h.rounded()))" }
+            .joined(separator: "|")
     }
 
-    public var sampleCount: Int { lock.lock(); defer { lock.unlock() }; return calibration.count + clicks.count }
+    /// Switch the live state to the profile for `sig` (caller holds the lock).
+    private func activate(_ sig: String, displays: [Displays.Info]) {
+        guard sig != activeSignature else { return }
+        stashActive(displays: nil)
+        let p = profiles[sig]
+        calibration = p?.samples.filter { !$0.click } ?? []
+        clicks = Array((p?.samples.filter { $0.click } ?? []).suffix(Self.maxClickSamples))
+        model = p?.model
+        drift = 0; clicksSinceFit = 0
+        activeSignature = sig
+    }
+
+    /// Write the live state back into `profiles` (caller holds the lock).
+    private func stashActive(displays: [Displays.Info]?) {
+        guard let sig = activeSignature else { return }
+        if model == nil && calibration.isEmpty && clicks.isEmpty { profiles[sig] = nil; return }
+        let arr = displays.map { Self.arrangement(of: $0) } ?? profiles[sig]?.arrangement ?? []
+        profiles[sig] = Profile(arrangement: arr, samples: calibration + clicks, model: model)
+    }
+
+    private func syncToCurrent() -> [Displays.Info] {
+        let d = displaysProvider()
+        activate(Self.signature(of: d), displays: d)
+        return d
+    }
+
+    public var isCalibrated: Bool {
+        lock.lock(); defer { lock.unlock() }
+        _ = syncToCurrent()
+        return model != nil
+    }
+
+    /// Number of known arrangement profiles (including the active one).
+    public var profileCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        _ = syncToCurrent(); stashActive(displays: displaysProvider())
+        return profiles.count
+    }
+
+    public var sampleCount: Int { lock.lock(); defer { lock.unlock() }; _ = syncToCurrent(); return calibration.count + clicks.count }
 
     public var driftScore: Double { lock.lock(); defer { lock.unlock() }; return drift }
 
@@ -220,7 +270,10 @@ public final class RegressionGazeMapper: GazeMapper {
     /// Core entry with explicit displays (used by tests).
     func estimate(_ pose: HeadPose, currentDisplay: DisplayID?, edgeBias: Double,
                   displays: [Displays.Info]) -> GazeEstimate? {
-        lock.lock(); let m = model; lock.unlock()
+        lock.lock()
+        activate(Self.signature(of: displays), displays: displays)
+        let m = model
+        lock.unlock()
         guard let m, pose.confidence >= Self.minConfidence else { return nil }
         let p = m.predict(pose.features)
         guard p.x.isFinite, p.y.isFinite else { return nil }
@@ -240,6 +293,7 @@ public final class RegressionGazeMapper: GazeMapper {
         let s = StoredSample(f: pose.features, x: Double(target.x), y: Double(target.y),
                              w: weight, click: weight < Self.clickWeightThreshold)
         lock.lock()
+        _ = syncToCurrent()
         if s.click {
             clicks.append(s)
             if clicks.count > Self.maxClickSamples { clicks.removeFirst(clicks.count - Self.maxClickSamples) }
@@ -254,39 +308,51 @@ public final class RegressionGazeMapper: GazeMapper {
 
     @discardableResult public func fit() -> Bool {
         lock.lock()
+        _ = syncToCurrent()
         let all = (calibration + clicks).map {
             GazeModel.Sample(features: $0.f, target: CGPoint(x: $0.x, y: $0.y), weight: $0.w)
         }
         lock.unlock()
         guard let m = GazeModel.fit(all) else { return false }
-        let arr = Self.arrangement(of: displaysProvider())
         lock.lock()
-        model = m; arrangement = arr; clicksSinceFit = 0
+        model = m; clicksSinceFit = 0
         lock.unlock()
         return true
     }
 
+    /// Clears only the profile for the current arrangement.
     public func reset() {
         lock.lock(); defer { lock.unlock() }
-        calibration = []; clicks = []; model = nil; arrangement = []; drift = 0; clicksSinceFit = 0
+        let d = displaysProvider()
+        let sig = Self.signature(of: d)
+        profiles[sig] = nil
+        activeSignature = sig
+        calibration = []; clicks = []; model = nil; drift = 0; clicksSinceFit = 0
     }
 
     public func save() throws {
         lock.lock()
-        let blob = Persisted(arrangement: arrangement, samples: calibration + clicks, model: model)
+        let d = syncToCurrent()
+        stashActive(displays: d)
+        let blob = Persisted(profiles: profiles)
         lock.unlock()
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONEncoder().encode(blob).write(to: url, options: .atomic)
     }
 
+    /// Loads all profiles and activates the one matching the current arrangement.
     public func load() throws {
         let blob = try JSONDecoder().decode(Persisted.self, from: Data(contentsOf: url))
+        var loaded = blob.profiles
+        if let arr = blob.arrangement, let samples = blob.samples {   // v1 migration
+            let sig = arr.map { "\($0.id):\(Int($0.x.rounded())),\(Int($0.y.rounded())),\(Int($0.w.rounded()))x\(Int($0.h.rounded()))" }
+                .joined(separator: "|")
+            if loaded[sig] == nil { loaded[sig] = Profile(arrangement: arr, samples: samples, model: blob.model) }
+        }
         lock.lock(); defer { lock.unlock() }
-        calibration = blob.samples.filter { !$0.click }
-        clicks = Array(blob.samples.filter { $0.click }.suffix(Self.maxClickSamples))
-        model = blob.model
-        arrangement = blob.arrangement
-        drift = 0; clicksSinceFit = 0
+        profiles = loaded
+        activeSignature = nil
+        _ = syncToCurrent()
     }
 
     public func recordClickOutcome(predicted: DisplayID?, actual: DisplayID) {
