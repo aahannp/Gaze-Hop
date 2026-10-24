@@ -6,8 +6,15 @@ import PackageDescription
 let package = Package(
     name: "GlanceSwitch",
     platforms: [.macOS(.v14)],
+    dependencies: [
+        // Pinned exactly (supply chain). Used by the MediaPipe mesh tracker.
+        .package(url: "https://github.com/microsoft/onnxruntime-swift-package-manager", exact: "1.19.2"),
+    ],
     targets: [
-        .target(name: "GlanceKit", path: "Sources/GlanceKit"),
+        .target(name: "GlanceKit",
+                dependencies: [.product(name: "onnxruntime", package: "onnxruntime-swift-package-manager")],
+                path: "Sources/GlanceKit",
+                resources: [.copy("Tracking/Models")]),
         .executableTarget(name: "GlanceSwitch", dependencies: ["GlanceKit"], path: "Sources/GlanceSwitch"),
         .testTarget(name: "GlanceSwitchTests", dependencies: ["GlanceKit"], path: "Tests/GlanceSwitchTests"),
     ]

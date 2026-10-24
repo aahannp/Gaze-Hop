@@ -42,3 +42,10 @@ struct PoseSmoother {
         return out
     }
 }
+
+extension PoseSmoother {
+    /// Mesh tracker: 478-point landmarks are far less noisy than Vision's, so almost no median
+    /// and a high One-Euro cutoff (retuned from the live benchmark).
+    static let mesh = Config(angleMedian: 1, angle: (3.0, 30.0, 3.0), position: (4.0, 5.0, 3.0),
+                             eye: (3.0, 10.0, 3.0), otherMedian: 1)
+}
