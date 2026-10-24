@@ -76,10 +76,11 @@ if otool -L "$SAPP/Contents/MacOS/$APP_NAME" | tail -n +2 | awk '{print $1}' \
   exit 1
 fi
 
-# Generated icon (eye glyph on a gradient squircle) — best effort.
+# Generated icon (BrandMark's vector mark, see Resources/make_icon.swift) — best effort.
 if [[ -f Resources/make_icon.swift ]]; then
-  ICONSET=$(mktemp -d)/AppIcon.iconset
-  if swift Resources/make_icon.swift "$ICONSET" >/dev/null 2>&1 && iconutil -c icns "$ICONSET" -o "$SAPP/Contents/Resources/AppIcon.icns" 2>/dev/null; then
+  ICONTMP=$(mktemp -d); ICONSET=$ICONTMP/AppIcon.iconset
+  if swiftc -parse-as-library Resources/make_icon.swift Sources/GlanceKit/App/BrandMark.swift -o "$ICONTMP/make_icon" >/dev/null 2>&1 \
+     && "$ICONTMP/make_icon" "$ICONSET" && iconutil -c icns "$ICONSET" -o "$SAPP/Contents/Resources/AppIcon.icns" 2>/dev/null; then
     :
   else
     echo "warning: icon generation failed; continuing without icon"

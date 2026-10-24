@@ -273,14 +273,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func applyStatus(_ v: AppStatusValue) {
         guard statusItem != nil else { return }
         let summary = StatusSummary(v)
-        let iconName: String
-        if v.calibrating { iconName = "scope" }
-        else if summary.tone == .attention { iconName = "eye.trianglebadge.exclamationmark" }
-        else if v.paused { iconName = "eye.slash" }
-        else { iconName = "eye" }
-        let img = NSImage(systemSymbolName: iconName, accessibilityDescription: "GazeHop")
-            ?? NSImage(systemSymbolName: "eye", accessibilityDescription: "GazeHop")
-        img?.isTemplate = true
+        let img: NSImage?
+        if v.calibrating { img = BrandMark.menuBarImage(.calibrating) }
+        else if summary.tone == .attention {
+            img = NSImage(systemSymbolName: "eye.trianglebadge.exclamationmark", accessibilityDescription: "GazeHop")
+            img?.isTemplate = true
+        }
+        else if v.paused { img = BrandMark.menuBarImage(.paused) }
+        else { img = BrandMark.menuBarImage(.tracking) }
         statusItem.button?.image = img
 
         var tip = "GazeHop — \(StatusSummary.menuLine(v))"
