@@ -108,8 +108,8 @@ final class CalibrationMapperTests: XCTestCase {
             if let id = e?.displayID, id != cur { switches += 1; cur = id }
         }
         XCTAssertEqual(switches, 0)
-        // A decisive move still switches.
-        let e = m.estimate(FakeGaze.pose(for: CGPoint(x: 2900, y: 700), size: 0.3, rng: &rng), currentDisplay: cur, edgeBias: 0.5, displays: FakeGaze.both)
+        // A decisive move still switches (leaving needs a high posterior).
+        let e = m.estimate(FakeGaze.pose(for: CGPoint(x: 3700, y: 700), size: 0.3, rng: &rng), currentDisplay: cur, edgeBias: 0.5, displays: FakeGaze.both)
         XCTAssertEqual(e?.displayID, 2)
     }
 
@@ -251,5 +251,50 @@ final class CalibrationPlanTests: XCTestCase {
         let plans = CalibrationController.makePlans(displays: [ext, lap])
         XCTAssertEqual(plans.map { $0.points.count }, [12, 12])
         for p in plans { for s in CalibrationController.makeSteps(for: p) { XCTAssertTrue(p.display.frame.contains(s.target)) } }
+    }
+}
+
+
+/// Looking down at the keyboard must never read as the other (lower / side) display.
+final class CalibrationKeyboardTests: XCTestCase {
+    func testLookingDownNeverSwitchesDisplay() {
+        let (m, _) = FakeGaze.mapper()
+        var rng = SplitMix(s: 5)
+        for d in FakeGaze.both {
+            for gx in 0..<5 {
+                let x = d.frame.minX + d.frame.width * (0.1 + 0.8 * Double(gx) / 4)
+                for dy in [2000.0, 2500.0, 3500.0] {      // far below the lowest calibrated row
+                    let p = FakeGaze.pose(for: CGPoint(x: x, y: dy), size: 0.3, rng: &rng)
+                    // yaw is as on display d and the user is working there: never jump to the other one
+                    let e = m.estimate(p, currentDisplay: d.id, edgeBias: 0.5, displays: FakeGaze.both)
+                    XCTAssertTrue(e?.displayID == nil || e?.displayID == d.id, "x=\(x) y=\(dy) d=\(d.id)")
+                    XCTAssertNil(e?.displayID, "below the pitch floor is off-screen")
+                }
+            }
+        }
+    }
+
+    func testPitchDoesNotChangeLeftRight() {
+        let (m, _) = FakeGaze.mapper()
+        var rng = SplitMix(s: 6)
+        for x in [1000.0, 1800.0, 3400.0, 4200.0] {
+            let want: DisplayID = x < 2560 ? 1 : 2
+            for y in [300.0, 700.0, 1100.0] {   // within the calibrated pitch range
+                let e = m.estimate(FakeGaze.pose(for: CGPoint(x: x, y: y), size: 0.3, rng: &rng), currentDisplay: nil, edgeBias: 0.5, displays: FakeGaze.both)
+                XCTAssertEqual(e?.displayID, want, "x=\(x) y=\(y)")
+            }
+        }
+    }
+
+    func testClassifierRoundTripsThroughPersistence() throws {
+        let (m, url) = FakeGaze.mapper()
+        try m.save()
+        let m2 = RegressionGazeMapper(url: url, displays: { FakeGaze.both })
+        try m2.load()
+        var rng = SplitMix(s: 8)
+        let p = FakeGaze.pose(for: CGPoint(x: 1000, y: 3000), size: 0.3, rng: &rng)
+        XCTAssertNil(m2.estimate(p, currentDisplay: 2, edgeBias: 0.5, displays: FakeGaze.both)?.displayID)
+        let q = FakeGaze.pose(for: CGPoint(x: 1000, y: 700), size: 0.3, rng: &rng)
+        XCTAssertEqual(m2.estimate(q, currentDisplay: 1, edgeBias: 0.5, displays: FakeGaze.both)?.displayID, 1)
     }
 }
