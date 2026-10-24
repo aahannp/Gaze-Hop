@@ -46,6 +46,11 @@ public final class SwitchEngine {
     /// looking down at the keyboard — never qualifies.
     public var minTurnMotion = 0.04           // radians
     public var motionWindow: TimeInterval = 0.3
+    /// Eye saccades are fast: shorter window, threshold on the eyeOffset scale (-1...1).
+    public var eyeMotionWindow: TimeInterval = 0.12
+    public var minEyeMotion = 0.15
+    /// Frames with the eyes this closed never count as eye motion (eyeOffset is unreliable).
+    public var blinkOpenness = 0.3
     /// Within this long after the last key, switching needs the full dwell with no gap frames.
     public var postTypingStrict: TimeInterval = 1.5
     public var fastFrames = 2
@@ -69,7 +74,7 @@ public final class SwitchEngine {
     private var candidateStrict = false
     private var heldSince: TimeInterval?
     private var heldUntil: TimeInterval = 0
-    private var poseHistory: [(t: TimeInterval, yaw: Double, pitch: Double)] = []
+    private var poseHistory: [(t: TimeInterval, yaw: Double, pitch: Double, eyeDX: Double, eyeDY: Double, open: Double)] = []
     private var lastSwitchAt: TimeInterval = -.infinity
     private var faceLostSince: TimeInterval?
     private var statStart: TimeInterval?
@@ -142,7 +147,7 @@ public final class SwitchEngine {
             return
         }
         latestPose = pose; latestPoseAt = t
-        poseHistory.append((t, pose.yaw, pose.pitch))
+        poseHistory.append((t, pose.yaw, pose.pitch, Double(pose.eyeOffset.dx), Double(pose.eyeOffset.dy), pose.eyeOpenness))
         poseHistory.removeAll { t - $0.t > 0.6 }
 
         if currentDisplay == nil { currentDisplay = focus.focusedDisplay() }
@@ -192,7 +197,7 @@ public final class SwitchEngine {
                 heldUntil = t; holdSeen = h
                 candidateSince = t; decisiveFrames = 0; candidateAfterHold = true
             } else {
-                decisiveFrames = isDecisive(est, display: display) && isTurning(toward: display, at: t)
+                decisiveFrames = isDecisive(est, display: display) && isTurning(toward: display, at: t, settings: s)
                     ? decisiveFrames + 1 : 0
                 // Anti-flicker: right after a switch, going back needs the full dwell.
                 let flickerGuard = t - lastSwitchAt < flickerWindow
@@ -229,18 +234,38 @@ public final class SwitchEngine {
         return hypot(dx, dy) >= decisiveFraction * frame.width
     }
 
-    /// Head moving toward `display` over the last `motionWindow` (yaw for side-by-side displays,
-    /// pitch for stacked ones). Needs real history: a pose that has been static never qualifies.
-    private func isTurning(toward display: DisplayID, at t: TimeInterval) -> Bool {
+    /// Head and/or eyes moving toward `display` (side-by-side displays use x motion, stacked ones y),
+    /// according to `gazeMode`: head = yaw/pitch over `motionWindow`, eyes = eye offset over the shorter
+    /// `eyeMotionWindow`, both = the two scores blended by `eyeWeight`. Needs real history: a static
+    /// pose never qualifies, and blink frames add no eye motion.
+    private func isTurning(toward display: DisplayID, at t: TimeInterval, settings s: Settings) -> Bool {
         guard let cur = currentDisplay, let c = displayFrame(cur), let d = displayFrame(display),
-              let latest = poseHistory.last,
-              let ref = poseHistory.first(where: { t - $0.t <= motionWindow + 0.05 }),
-              latest.t - ref.t >= motionWindow * 0.6 else { return false }
+              let latest = poseHistory.last else { return false }
         let dx = d.midX - c.midX, dy = d.midY - c.midY
-        let delta = abs(dx) >= abs(dy)
-            ? (latest.yaw - ref.yaw) * (dx >= 0 ? 1 : -1)        // + yaw = user's right
-            : (latest.pitch - ref.pitch) * (dy < 0 ? 1 : -1)     // + pitch = up; CG y grows down
-        return delta >= minTurnMotion
+        let horizontal = abs(dx) >= abs(dy)
+        func span(_ window: TimeInterval) -> (t: TimeInterval, yaw: Double, pitch: Double, eyeDX: Double, eyeDY: Double, open: Double)? {
+            guard let ref = poseHistory.first(where: { t - $0.t <= window + 0.05 }),
+                  latest.t - ref.t >= window * 0.6 else { return nil }
+            return ref
+        }
+        var head = 0.0, eye = 0.0
+        if s.gazeMode != .eyes, let ref = span(motionWindow) {
+            let delta = horizontal ? (latest.yaw - ref.yaw) * (dx >= 0 ? 1 : -1)        // + yaw = user's right
+                                   : (latest.pitch - ref.pitch) * (dy < 0 ? 1 : -1)     // + pitch = up; CG y grows down
+            head = delta / minTurnMotion
+        }
+        if s.gazeMode != .head, latest.open >= blinkOpenness, let ref = span(eyeMotionWindow), ref.open >= blinkOpenness {
+            let delta = horizontal ? (latest.eyeDX - ref.eyeDX) * (dx >= 0 ? 1 : -1)
+                                   : (latest.eyeDY - ref.eyeDY) * (dy < 0 ? 1 : -1)
+            eye = delta / minEyeMotion
+        }
+        switch s.gazeMode {
+        case .head: return head >= 1
+        case .eyes: return eye >= 1
+        case .both:
+            let w = min(max(s.eyeWeight, 0), 1)
+            return (1 - w) * head + w * eye >= 1
+        }
     }
 
     /// Drops the pending candidate. A non-nil `reason` logs a `miss` if it had been pending >= 100 ms.

@@ -17,6 +17,10 @@ public enum GlanceApp {
     }
 }
 
+/// Implemented by mappers that can tell the eye model has no samples yet (RegressionGazeMapper's
+/// `needsEyeCalibration`; add `extension RegressionGazeMapper: EyeCalibrationReporting {}` once it lands).
+protocol EyeCalibrationReporting: AnyObject { var needsEyeCalibration: Bool { get } }
+
 final class AppController: NSObject, NSApplicationDelegate {
     private let store = SettingsStore()
     private let hub = PoseHub()
@@ -26,6 +30,8 @@ final class AppController: NSObject, NSApplicationDelegate {
     private let input: InputActivityMonitoring = InputMonitor()
     private let calibrator: Calibrating = CalibrationController()
     private let overlay = GazeOverlay()
+    private lazy var liveModel = LiveFaceModel(hub: hub)
+    private var liveWindow: NSWindow?
     private var engine: SwitchEngine!
 
     private var statusItem: NSStatusItem!
@@ -50,11 +56,16 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? mapper.load()
+        syncMapperMode()
+        liveModel.onVisibilityChange = { [weak self] in self?.updateCamera() }
 
         engine = SwitchEngine(mapper: mapper, focus: focus, input: input, settings: { [weak self] in
             self?.store.settings ?? Settings()
         })
-        engine.onStateChange = { [weak self] in self?.overlay.update($0) }
+        engine.onStateChange = { [weak self] in
+            self?.overlay.update($0)
+            self?.liveModel.update(state: $0)
+        }
         engine.onDriftSuggested = { [weak self] in self?.suggestRecalibration(reason: "Gaze accuracy seems to have dropped.") }
 
         hub.observe { [weak self] pose in
@@ -111,6 +122,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         menu.addItem(driftItem)
         menu.addItem(item("Recalibrate…", #selector(recalibrateAction), key: "r"))
         menu.addItem(.separator())
+        menu.addItem(item("Live Face…", #selector(openLiveFace)))
         menu.addItem(item("Settings…", #selector(openSettings), key: ","))
         menu.addItem(item("Welcome Guide", #selector(openWelcome)))
         menu.addItem(.separator())
@@ -143,7 +155,16 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     // MARK: Settings changes
 
+    /// The mapper's mode/weight mirror Settings; keep them in step on launch and every change.
+    private func syncMapperMode() {
+        store.settings.apply(to: mapper)
+        liveModel.mode = store.settings.gazeMode
+        liveModel.eyeWeight = store.settings.eyeWeight
+        liveModel.calibrated = mapper.isCalibrated
+    }
+
     private func settingsChanged(_ old: Settings, _ new: Settings) {
+        if old.gazeMode != new.gazeMode || old.eyeWeight != new.eyeWeight { syncMapperMode() }
         if old.paused != new.paused { engine.reset(); refreshStatusIcon() }
         if old.showGazeDot != new.showGazeDot { overlay.setVisible(new.showGazeDot) }
         if old.cameraID != new.cameraID, tracker.isRunning { tracker.stop() }
@@ -169,9 +190,10 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     private func updateCamera() {
+        liveModel.calibrated = mapper.isCalibrated
         ensureInputMonitor()
         let wantTracking = !store.settings.paused && mapper.isCalibrated
-        let want = (wantTracking || calibrating) && suspendReasons.isEmpty && Permissions.cameraGranted
+        let want = (wantTracking || calibrating || liveModel.isVisible) && suspendReasons.isEmpty && Permissions.cameraGranted
         if want, !tracker.isRunning {
             do {
                 try tracker.start(cameraID: store.settings.cameraID)
@@ -314,6 +336,22 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     @objc private func openWelcome() { showWelcome() }
     @objc private func openSettings() { showSettings() }
+    @objc private func openLiveFace() { showLiveFace() }
+
+    private func showLiveFace() {
+        if liveWindow == nil {
+            liveModel.calibrated = mapper.isCalibrated
+            let w = makeWindow(title: "Live Face", content: LiveFacePanel(model: liveModel).frame(width: 380, height: 640))
+            w.styleMask = [.titled, .closable, .miniaturizable]
+            // Dropping the content view on close fires onDisappear, which stops the hub subscription and rendering.
+            NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: w, queue: .main) { [weak self] _ in
+                self?.liveWindow?.contentViewController = nil
+                self?.liveWindow = nil
+            }
+            liveWindow = w
+        }
+        present(liveWindow!)
+    }
 
     private func showWelcome() {
         UserDefaults.standard.set(true, forKey: welcomeShownKey)
@@ -339,7 +377,11 @@ final class AppController: NSObject, NSApplicationDelegate {
         if settingsWindow == nil {
             let view = SettingsView(store: store,
                                     onRecalibrate: { [weak self] in self?.recalibrate() },
-                                    onResetCalibration: { [weak self] in self?.resetCalibration() })
+                                    onResetCalibration: { [weak self] in self?.resetCalibration() },
+                                    liveModel: liveModel,
+                                    needsEyeCalibration: { [weak self] in
+                                        (self?.mapper as? EyeCalibrationReporting)?.needsEyeCalibration ?? false
+                                    })
             settingsWindow = makeWindow(title: "Glance Switch Settings", content: view)
         }
         present(settingsWindow!)

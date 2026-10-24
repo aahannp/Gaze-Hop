@@ -26,3 +26,11 @@ public final class SettingsStore: ObservableObject {
         if let data = try? JSONEncoder().encode(settings) { defaults.set(data, forKey: Self.key) }
     }
 }
+
+extension Settings {
+    /// The mapper mirrors the tracking mode and eye/head weight from Settings.
+    public func apply(to mapper: GazeMapper) {
+        mapper.gazeMode = gazeMode
+        mapper.eyeWeight = eyeWeight
+    }
+}

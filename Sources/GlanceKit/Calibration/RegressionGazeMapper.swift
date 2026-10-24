@@ -10,6 +10,13 @@ public struct GazeModel: Codable, Equatable {
     var scale: [Double]
     /// Two rows (x, y). Each row = [bias, w_0 ... w_{n-1}] over standardized expanded features.
     var coef: [[Double]]
+    /// Indices into `expand(f)` this model uses (nil = all, models saved before gaze modes).
+    var columns: [Int]? = nil
+
+    /// Expanded-feature columns of the head component: everything except the eye terms.
+    static let headColumns = [0, 1, 2, 3, 4, 7, 8, 9]
+
+    static func select(_ r: [Double], _ columns: [Int]?) -> [Double] { columns.map { c in c.map { r[$0] } } ?? r }
 
     /// Raw features + interaction terms that let the head-turn gain change with distance.
     static func expand(_ f: [Double]) -> [Double] {
@@ -20,9 +27,10 @@ public struct GazeModel: Codable, Equatable {
 
     struct Sample { var features: [Double]; var target: CGPoint; var weight: Double }
 
-    static func fit(_ samples: [Sample], ridge: Double = 0.03) -> GazeModel? {
+    /// `columns` restricts the model to a subset of the expanded features; `penalty` scales the ridge per selected column.
+    static func fit(_ samples: [Sample], ridge: Double = 0.03, columns: [Int]? = nil, penalty: [Double]? = nil) -> GazeModel? {
         guard samples.count >= 12 else { return nil }
-        let rows = samples.map { expand($0.features) }
+        let rows = samples.map { select(expand($0.features), columns) }
         let n = rows[0].count
         let wsum = samples.reduce(0) { $0 + $1.weight }
         guard wsum > 0 else { return nil }
@@ -45,13 +53,13 @@ public struct GazeModel: Codable, Equatable {
                 bx[i] += zi * Double(s.target.x); by[i] += zi * Double(s.target.y)
             }
         }
-        for i in 1..<p { a[i][i] += ridge * wsum }   // bias unpenalized
+        for i in 1..<p { a[i][i] += ridge * wsum * (penalty?[i - 1] ?? 1) }   // bias unpenalized
         guard let cx = solve(a, bx), let cy = solve(a, by) else { return nil }
-        return GazeModel(mean: mean, scale: scale, coef: [cx, cy])
+        return GazeModel(mean: mean, scale: scale, coef: [cx, cy], columns: columns)
     }
 
     func predict(_ f: [Double]) -> CGPoint {
-        let r = GazeModel.expand(f)
+        let r = GazeModel.select(GazeModel.expand(f), columns)
         var x = coef[0][0], y = coef[1][0]
         for j in 0..<r.count {
             let z = (r[j] - mean[j]) / scale[j]
@@ -94,8 +102,6 @@ public struct GazeModel: Codable, Equatable {
 struct DisplayClassifier: Codable, Equatable {
     /// Feature indices into HeadPose.features: yaw 0, pitch 1, faceCenter.x 2, faceCenter.y 3, eyeDx 5, eyeDy 6.
     /// Left/right is decided by horizontal evidence only; up/down by vertical evidence only.
-    static let horizontalFeatures = [0, 2, 5]
-    static let verticalFeatures = [1, 3, 6]
     static let minPerClass = 4
     static let edgeBiasStrength = 6.0     // nats of log-odds at edgeBias 0 / 1
     static let enterPrimaryThreshold = 0.65 // returning to the largest display is allowed to be easier
@@ -118,7 +124,12 @@ struct DisplayClassifier: Codable, Equatable {
 
     /// Feature set for an arrangement: horizontal evidence for side-by-side, vertical for stacked,
     /// both when the displays are offset in both directions.
-    static func features(for displays: [Displays.Info]) -> [Int] {
+    enum Source { case head, eyes }
+
+    /// Head: yaw / faceCenter. Eyes: eye offset, with head pose only compensating.
+    static func features(for displays: [Displays.Info], source: Source = .head) -> [Int] {
+        let horizontalFeatures = source == .head ? [0, 2] : [5, 0]
+        let verticalFeatures = source == .head ? [1, 3] : [6, 1]
         let cx = displays.map { $0.frame.midX }, cy = displays.map { $0.frame.midY }
         let sx = (cx.max() ?? 0) - (cx.min() ?? 0), sy = (cy.max() ?? 0) - (cy.min() ?? 0)
         if sx >= sy { return sy > 0.25 * sx ? horizontalFeatures + verticalFeatures : horizontalFeatures }
@@ -189,9 +200,8 @@ struct DisplayClassifier: Codable, Equatable {
 
     func isOffscreenPitch(_ pitch: Double) -> Bool { pitch < pitchFloor || pitch > pitchCeiling }
 
-    /// `positions`: per-display coordinate in -1...1 along the arrangement's main axis (for edgeBias).
-    /// Leaving `current` needs a posterior >= `leaveThreshold`; entering from nowhere takes the argmax.
-    func classify(_ f: [Double], current: DisplayID?, edgeBias: Double, positions: [DisplayID: Double], primary: DisplayID? = nil) -> Result {
+    /// Class posteriors (same order as `classes`) with the edgeBias log-odds shift applied.
+    func posterior(_ f: [Double], edgeBias: Double, positions: [DisplayID: Double]) -> (post: [Double], minD2: Double) {
         let raw = pick(f)
         let z = (0..<raw.count).map { (raw[$0] - mean[$0]) / scale[$0] }
         var scores: [Double] = [], minD2 = Double.infinity
@@ -204,13 +214,24 @@ struct DisplayClassifier: Codable, Equatable {
         let top = scores.max()!
         let exps = scores.map { exp($0 - top) }
         let total = exps.reduce(0, +)
-        let post = exps.map { $0 / total }
-        let best = scores.firstIndex(of: top)!
+        return (exps.map { $0 / total }, minD2)
+    }
+
+    /// Leaving `current` needs a posterior >= `leaveThreshold`; entering from nowhere takes the argmax.
+    static func decide(classes: [DisplayID], post: [Double], current: DisplayID?, primary: DisplayID?) -> (id: DisplayID, probability: Double) {
+        let best = post.indices.max { post[$0] < post[$1] }!
         if let cur = current, let ci = classes.firstIndex(of: cur), ci != best,
-           post[best] < (classes[best] == primary ? DisplayClassifier.enterPrimaryThreshold : DisplayClassifier.leaveThreshold) {
-            return Result(id: cur, probability: post[ci], minD2: minD2)
+           post[best] < (classes[best] == primary ? enterPrimaryThreshold : leaveThreshold) {
+            return (cur, post[ci])
         }
-        return Result(id: classes[best], probability: post[best], minD2: minD2)
+        return (classes[best], post[best])
+    }
+
+    /// `positions`: per-display coordinate in -1...1 along the arrangement's main axis (for edgeBias).
+    func classify(_ f: [Double], current: DisplayID?, edgeBias: Double, positions: [DisplayID: Double], primary: DisplayID? = nil) -> Result {
+        let (post, minD2) = posterior(f, edgeBias: edgeBias, positions: positions)
+        let d = Self.decide(classes: classes, post: post, current: current, primary: primary)
+        return Result(id: d.id, probability: d.probability, minD2: minD2)
     }
 }
 
@@ -291,7 +312,11 @@ enum DisplayResolver {
 // MARK: - Mapper
 
 public final class RegressionGazeMapper: GazeMapper {
-    struct StoredSample: Codable { var f: [Double]; var x: Double; var y: Double; var w: Double; var click: Bool }
+    struct StoredSample: Codable {
+        var f: [Double]; var x: Double; var y: Double; var w: Double; var click: Bool
+        /// Captured with the head held still (eyes-only phase). nil in profiles saved before gaze modes.
+        var eyes: Bool? = nil
+    }
     struct StoredDisplay: Codable, Equatable { var id: UInt32; var x: Double; var y: Double; var w: Double; var h: Double }
     /// One calibration for one display arrangement.
     struct Profile: Codable {
@@ -299,6 +324,8 @@ public final class RegressionGazeMapper: GazeMapper {
         var samples: [StoredSample]
         var model: GazeModel?
         var classifier: DisplayClassifier?
+        var eyeModel: GazeModel?
+        var eyeClassifier: DisplayClassifier?
     }
     struct Persisted: Codable {
         var version = 2
@@ -315,6 +342,8 @@ public final class RegressionGazeMapper: GazeMapper {
     }()
 
     public static let minConfidence = 0.3
+    static let blinkThreshold = 0.5
+    static let minEyeSamplesPerDisplay = 4
     static let maxClickSamples = 150
     static let clickWeightThreshold = 0.9
     static let refitEveryClicks = 10
@@ -331,6 +360,11 @@ public final class RegressionGazeMapper: GazeMapper {
     private var model: GazeModel?
     private var classifier: DisplayClassifier?
     private var classifierTried = false
+    private var eyeModel: GazeModel?
+    private var eyeClassifier: DisplayClassifier?
+    private var lastEye: (dx: Double, dy: Double)?
+    /// Test hook: treat every calibration sample as eyes-only data when training the eye component.
+    var treatAllAsEyes = false
     /// Test hook: false = old pipeline (regression point -> DisplayResolver only).
     var useClassifier = true
     var ridge = 0.03
@@ -363,9 +397,17 @@ public final class RegressionGazeMapper: GazeMapper {
         clicks = Array((p?.samples.filter { $0.click } ?? []).suffix(Self.maxClickSamples))
         model = p?.model
         classifier = p?.classifier
+        eyeModel = p?.eyeModel
+        eyeClassifier = p?.eyeClassifier
         classifierTried = false
+        lastEye = nil
         drift = 0; clicksSinceFit = 0
         activeSignature = sig
+        // Profiles saved before gaze modes hold a model that mixed in the eye terms: refit as head + eye parts.
+        if model != nil, model?.columns != GazeModel.headColumns
+            || (classifier != nil && classifier?.featureIndex != DisplayClassifier.features(for: displays, source: .head)) {
+            _ = retrainLocked(displays: displays)
+        }
     }
 
     /// Write the live state back into `profiles` (caller holds the lock).
@@ -373,7 +415,8 @@ public final class RegressionGazeMapper: GazeMapper {
         guard let sig = activeSignature else { return }
         if model == nil && calibration.isEmpty && clicks.isEmpty { profiles[sig] = nil; return }
         let arr = displays.map { Self.arrangement(of: $0) } ?? profiles[sig]?.arrangement ?? []
-        profiles[sig] = Profile(arrangement: arr, samples: calibration + clicks, model: model, classifier: classifier)
+        profiles[sig] = Profile(arrangement: arr, samples: calibration + clicks, model: model, classifier: classifier,
+                               eyeModel: eyeModel, eyeClassifier: eyeClassifier)
     }
 
     private func syncToCurrent() -> [Displays.Info] {
@@ -398,9 +441,18 @@ public final class RegressionGazeMapper: GazeMapper {
     public var sampleCount: Int { lock.lock(); defer { lock.unlock() }; _ = syncToCurrent(); return calibration.count + clicks.count }
 
     public var driftScore: Double { lock.lock(); defer { lock.unlock() }; return drift }
-    // TODO(calibration worker): honour these in estimate(); for now the mapper ignores them.
+    /// Which signal decides (set from Settings). Eyes / both need eye calibration; without it they use the head.
     public var gazeMode: GazeMode = .both
+    /// 0...1, share of the decision given to the eyes in `.both`.
     public var eyeWeight: Double = 0.7
+
+    /// True when the profile for the current arrangement has no eyes-only calibration, so eyes / both
+    /// fall back to head. The UI can use it to suggest recalibrating for eye tracking.
+    public var needsEyeCalibration: Bool {
+        lock.lock(); defer { lock.unlock() }
+        _ = syncToCurrent()
+        return model != nil && (eyeModel == nil || eyeClassifier == nil)
+    }
 
     public func estimate(_ pose: HeadPose, currentDisplay: DisplayID?, edgeBias: Double) -> GazeEstimate? {
         estimate(pose, currentDisplay: currentDisplay, edgeBias: edgeBias, displays: displaysProvider())
@@ -411,30 +463,62 @@ public final class RegressionGazeMapper: GazeMapper {
                   displays: [Displays.Info]) -> GazeEstimate? {
         lock.lock()
         activate(Self.signature(of: displays), displays: displays)
-        let m = model
+        let m = model, em = eyeModel, eclf = eyeClassifier
+        if classifier == nil, m != nil, !classifierTried {
+            classifierTried = true
+            classifier = trainClassifier(displays: displays)
+        }
+        let hclf = classifier.flatMap { Set($0.classes) == Set(displays.map { $0.id }) ? $0 : nil }
+        // A blink makes the eye values junk: hold the last good ones.
+        let blink = pose.eyeOpenness < Self.blinkThreshold
+        var f = pose.features
+        var haveEye = true
+        if blink {
+            if let e = lastEye { f[5] = e.dx; f[6] = e.dy } else { haveEye = false }
+        } else if pose.confidence >= Self.minConfidence {
+            lastEye = (f[5], f[6])
+        }
+        let mode = gazeMode, ew = min(max(eyeWeight, 0), 1)
         lock.unlock()
         guard let m, pose.confidence >= Self.minConfidence else { return nil }
-        let p = m.predict(pose.features)
+
+        // Eyes / both need the eye component; otherwise (old profile, or no eye frame yet) use the head.
+        let eyesUsable = em != nil && eclf != nil && haveEye
+        let w: Double = !eyesUsable ? 0 : mode == .head ? 0 : mode == .eyes ? 1 : ew
+        let ph = m.predict(f)
+        var p = ph
+        if w > 0, let em { let pe = em.predict(f); p = CGPoint(x: (1 - w) * ph.x + w * pe.x, y: (1 - w) * ph.y + w * pe.y) }
         guard p.x.isFinite, p.y.isFinite else { return nil }
         let r = DisplayResolver.resolve(p, displays: displays, current: currentDisplay, edgeBias: edgeBias)
         var conf = pose.confidence
-        if useClassifier, let clf = currentClassifier(for: displays) {
+        if useClassifier, let clf = hclf {
             // Looking down at the keyboard/desk (or up) is off-screen, never another display.
             if clf.isOffscreenPitch(pose.pitch) {
                 return GazeEstimate(point: p, displayID: nil, confidence: conf * 0.5)
             }
-            let c = clf.classify(pose.features, current: currentDisplay, edgeBias: edgeBias,
-                                 positions: Self.positions(of: displays),
-                                 primary: displays.max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }?.id)
+            let pos = Self.positions(of: displays)
+            var (post, minD2) = clf.posterior(f, edgeBias: edgeBias, positions: pos)
+            var outlier = minD2 / clf.maxD2
+            if w > 0, let eclf, eclf.classes == clf.classes {
+                let e = eclf.posterior(f, edgeBias: edgeBias, positions: pos)
+                post = zip(post, e.post).map { (1 - w) * $0 + w * $1 }
+                outlier = (1 - w) * outlier + w * e.minD2 / eclf.maxD2
+            }
+            let primary = displays.max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }?.id
+            let d = DisplayClassifier.decide(classes: clf.classes, post: post, current: currentDisplay, primary: primary)
+            // A blink in an eye-driven mode never moves focus.
+            if blink && w > 0, let cur = currentDisplay, d.id != cur {
+                return GazeEstimate(point: p, displayID: cur, confidence: conf * 0.5)
+            }
             // Off-screen only when the pose is an outlier for every display AND the regressed
             // point also lies outside every display's margin (the point alone is noisy in y).
             let union = displays.map { $0.frame }.reduce(CGRect.null) { $0.union($1) }
             let slack = CGFloat(DisplayResolver.offscreenMargin) * union.width / CGFloat(max(displays.count, 1))
             let beyondX = p.x < union.minX - slack || p.x > union.maxX + slack
-            if r.id == nil && (c.minD2 > clf.maxD2 || beyondX) {
+            if r.id == nil && (outlier > 1 || beyondX) {
                 return GazeEstimate(point: p, displayID: nil, confidence: conf * 0.5)
             }
-            return GazeEstimate(point: p, displayID: c.id, confidence: conf * (0.5 + 0.5 * c.probability))
+            return GazeEstimate(point: p, displayID: d.id, confidence: conf * (0.5 + 0.5 * d.probability))
         }
         if let id = r.id, let d = displays.first(where: { $0.id == id }) {
             let ref = 0.1 * Double(min(d.frame.width, d.frame.height))
@@ -466,29 +550,52 @@ public final class RegressionGazeMapper: GazeMapper {
         return (dx * dx + dy * dy).squareRoot()
     }
 
-    private func trainClassifier(displays: [Displays.Info]) -> DisplayClassifier? {
+    private func trainClassifier(displays: [Displays.Info], source: DisplayClassifier.Source = .head,
+                                 eyesOnlyBoost: Double = 1) -> DisplayClassifier? {
         let samples = (calibration + clicks).compactMap { s -> DisplayClassifier.Sample? in
             guard let l = Self.label(CGPoint(x: s.x, y: s.y), displays) else { return nil }
-            return DisplayClassifier.Sample(features: s.f, label: l, weight: s.w)
+            let boost = isEyes(s) ? eyesOnlyBoost : 1
+            return DisplayClassifier.Sample(features: s.f, label: l, weight: s.w * boost)
         }
-        return DisplayClassifier.fit(samples, featureIndex: DisplayClassifier.features(for: displays))
+        return DisplayClassifier.fit(samples, featureIndex: DisplayClassifier.features(for: displays, source: source))
     }
 
-    /// The classifier, trained lazily for profiles saved before it existed. nil => use regression only.
-    private func currentClassifier(for displays: [Displays.Info]) -> DisplayClassifier? {
-        lock.lock(); defer { lock.unlock() }
-        if classifier == nil, model != nil, !classifierTried {
-            classifierTried = true
-            classifier = trainClassifier(displays: displays)
+    private func isEyes(_ s: StoredSample) -> Bool { s.eyes == true || (treatAllAsEyes && !s.click) }
+
+    /// Refit the head model, and the eye model + classifiers when there is enough eyes-only data.
+    /// Caller holds the lock. Returns false (leaving state untouched) when there is too little data.
+    private func retrainLocked(displays: [Displays.Info]) -> Bool {
+        let all = calibration + clicks
+        func samples(_ boost: Double) -> [GazeModel.Sample] {
+            all.map { GazeModel.Sample(features: $0.f, target: CGPoint(x: $0.x, y: $0.y), weight: $0.w * (isEyes($0) ? boost : 1)) }
         }
-        guard let c = classifier, Set(c.classes) == Set(displays.map { $0.id }) else { return nil }
-        return c
+        guard let head = GazeModel.fit(samples(1), ridge: ridge, columns: GazeModel.headColumns) else { return false }
+        model = head; clicksSinceFit = 0
+        classifier = trainClassifier(displays: displays); classifierTried = true
+        eyeModel = nil; eyeClassifier = nil
+        // Eye component: needs head-still samples on every display.
+        let eyeCounts = Dictionary(grouping: calibration.filter { isEyes($0) }.compactMap { Self.label(CGPoint(x: $0.x, y: $0.y), displays) }, by: { $0 })
+        if displays.allSatisfy({ (eyeCounts[$0.id]?.count ?? 0) >= Self.minEyeSamplesPerDisplay }) {
+            // Eye-in-head drives it; head columns are heavily regularised so they only compensate.
+            let cols = Array(0..<12)
+            let pen = cols.map { GazeModel.headColumns.contains($0) ? 8.0 : 1.0 }
+            if let em = GazeModel.fit(samples(2), ridge: ridge, columns: cols, penalty: pen),
+               let ec = trainClassifier(displays: displays, source: .eyes, eyesOnlyBoost: 2) {
+                eyeModel = em; eyeClassifier = ec
+            }
+        }
+        return true
     }
 
     public func addSample(_ pose: HeadPose, target: CGPoint, weight: Double) {
+        addSample(pose, target: target, weight: weight, eyesOnly: false)
+    }
+
+    /// `eyesOnly`: the head was held still while the eyes followed the target (guided eye phase).
+    public func addSample(_ pose: HeadPose, target: CGPoint, weight: Double, eyesOnly: Bool) {
         guard pose.features.allSatisfy({ $0.isFinite }) else { return }
         let s = StoredSample(f: pose.features, x: Double(target.x), y: Double(target.y),
-                             w: weight, click: weight < Self.clickWeightThreshold)
+                             w: weight, click: weight < Self.clickWeightThreshold, eyes: eyesOnly ? true : nil)
         lock.lock()
         _ = syncToCurrent()
         if s.click {
@@ -504,17 +611,9 @@ public final class RegressionGazeMapper: GazeMapper {
     }
 
     @discardableResult public func fit() -> Bool {
-        lock.lock()
+        lock.lock(); defer { lock.unlock() }
         _ = syncToCurrent()
-        let all = (calibration + clicks).map {
-            GazeModel.Sample(features: $0.f, target: CGPoint(x: $0.x, y: $0.y), weight: $0.w)
-        }
-        let displays = displaysProvider()
-        guard let m = GazeModel.fit(all, ridge: ridge) else { lock.unlock(); return false }
-        model = m; clicksSinceFit = 0
-        classifier = trainClassifier(displays: displays); classifierTried = true
-        lock.unlock()
-        return true
+        return retrainLocked(displays: displaysProvider())
     }
 
     /// Clears only the profile for the current arrangement.
@@ -524,7 +623,7 @@ public final class RegressionGazeMapper: GazeMapper {
         let sig = Self.signature(of: d)
         profiles[sig] = nil
         activeSignature = sig
-        calibration = []; clicks = []; model = nil; classifier = nil; classifierTried = false; drift = 0; clicksSinceFit = 0
+        calibration = []; clicks = []; model = nil; classifier = nil; eyeModel = nil; eyeClassifier = nil; lastEye = nil; classifierTried = false; drift = 0; clicksSinceFit = 0
     }
 
     public func save() throws {
