@@ -81,6 +81,7 @@ final class MeshPoseEstimator: FramePoseEstimator {
     var lastDetectMs = 0.0, lastLandmarkMs = 0.0
     /// Unsmoothed channels of the last pose (yaw, pitch, roll, cx, cy, size, eyeX, eyeY).
     private(set) var lastRaw: [Double]?
+    private var heldEye: (Double, Double) = (0, 0)
 
     init?(coreML: Bool = ProcessInfo.processInfo.environment["GLANCE_MESH_COREML"] == "1",
           smoother: PoseSmoother.Config = PoseSmoother.mesh) {
@@ -96,7 +97,7 @@ final class MeshPoseEstimator: FramePoseEstimator {
         anchors = Self.makeAnchors()
     }
 
-    func reset() { smoother.reset(); roi = nil }
+    func reset() { smoother.reset(); roi = nil; heldEye = (0, 0) }
 
     // MARK: pipeline
 
@@ -140,18 +141,23 @@ final class MeshPoseEstimator: FramePoseEstimator {
         roi = ROI(cx: (minX + maxX) / 2, cy: (minY + maxY) / 2, size: max(maxX - minX, maxY - minY) * 1.5,
                   angle: atan2(eyeV.y, eyeV.x))
 
-        let raw = Self.channels(pts: pts, w: Double(w), h: Double(h), bbox: (minX, maxX, minY, maxY))
+        var (raw, openness) = Self.channels(pts: pts, w: Double(w), h: Double(h), bbox: (minX, maxX, minY, maxY))
+        // Blink: hold the last good eye offset instead of emitting garbage.
+        if raw[6].isNaN { raw[6] = heldEye.0; raw[7] = heldEye.1 } else { heldEye = (raw[6], raw[7]) }
         lastRaw = raw
         let s = smoother.smooth(raw, at: t)
         return HeadPose(timestamp: t, yaw: s[0], pitch: s[1], roll: s[2],
                         faceCenter: CGPoint(x: s[3], y: s[4]), faceSize: s[5],
-                        eyeOffset: CGVector(dx: s[6], dy: s[7]), confidence: presence)
+                        eyeOffset: CGVector(dx: s[6], dy: s[7]), confidence: presence,
+                        eyeOpenness: openness)
     }
 
     // MARK: pose + iris
 
+    static let blinkThreshold = 0.35
+
     static func channels(pts: [SIMD3<Double>], w: Double, h: Double,
-                         bbox: (Double, Double, Double, Double)) -> [Double] {
+                         bbox: (Double, Double, Double, Double)) -> (v: [Double], open: Double) {
         func unit(_ v: SIMD3<Double>) -> SIMD3<Double> { v / max((v * v).sum().squareRoot(), 1e-9) }
         let xAxis = unit(pts[263] - pts[33])                         // face-left (image-right when frontal)
         var down = pts[152] - pts[10]
@@ -165,7 +171,7 @@ final class MeshPoseEstimator: FramePoseEstimator {
         let roll = -atan2(xAxis.y, xAxis.x)
 
         // Iris position inside each eye (corners + lids), image-right -> user's left.
-        func eye(_ outerL: Int, _ innerR: Int, _ iris: Int, _ up: Int, _ low: Int) -> (Double, Double)? {
+        func eye(_ outerL: Int, _ innerR: Int, _ iris: Int, _ up: Int, _ low: Int) -> (dx: Double, dy: Double, open: Double)? {
             let a = pts[outerL], b = pts[innerR]
             let ab = b - a
             let half = (ab * ab).sum().squareRoot() / 2
@@ -178,15 +184,23 @@ final class MeshPoseEstimator: FramePoseEstimator {
             let lidMid = (pts[up] + pts[low]) / 2
             let lidHalf = max(abs(((pts[low] - pts[up]) * vDown).sum()) / 2, half * 0.2)
             let dv = ((pts[iris] - lidMid) * vDown).sum() / lidHalf
-            return (max(-1, min(1, -t)), max(-1, min(1, -dv)))
+            // Eye aspect ratio: lid gap / eye width (~0.28 open, <0.12 closed).
+            let ear = abs(((pts[low] - pts[up]) * vDown).sum()) / (2 * half)
+            let open = max(0, min(1, (ear - 0.12) / 0.14))
+            return (max(-1, min(1, -t)), max(-1, min(1, -dv)), open)
         }
         // person's right eye = image-left: corners 33 (outer) .. 133 (inner); left eye: 362 (inner) .. 263 (outer)
         let e = [eye(33, 133, 468, 159, 145), eye(362, 263, 473, 386, 374)].compactMap { $0 }
-        let ex = e.isEmpty ? 0 : e.map(\.0).reduce(0, +) / Double(e.count)
-        let ey = e.isEmpty ? 0 : e.map(\.1).reduce(0, +) / Double(e.count)
+        let wsum = e.map(\.open).reduce(0, +)
+        let openness = e.isEmpty ? 0 : wsum / Double(e.count)
+        // Weight each eye by its openness; a closed pair yields nil so the caller holds the last value.
+        let ex: Double? = wsum > 0.05 ? e.map { $0.dx * $0.open }.reduce(0, +) / wsum : nil
+        let ey: Double? = wsum > 0.05 ? e.map { $0.dy * $0.open }.reduce(0, +) / wsum : nil
 
         let (minX, maxX, minY, maxY) = bbox
-        return [yaw, pitch, roll, 1 - (minX + maxX) / 2 / w, (minY + maxY) / 2 / h, (maxX - minX) / w, ex, ey]
+        let blinking = openness < Self.blinkThreshold || ex == nil
+        return ([yaw, pitch, roll, 1 - (minX + maxX) / 2 / w, (minY + maxY) / 2 / h, (maxX - minX) / w,
+                 blinking ? .nan : ex!, blinking ? .nan : ey!], openness)
     }
 
     // MARK: detector
