@@ -29,3 +29,8 @@ public enum PoseTrackerFactory {
         return CameraPoseTracker()
     }
 }
+
+extension CameraPoseTracker {
+    /// `--mesh-bench`: headless Vision-vs-mesh comparison on the same live frames (stats only).
+    public static func runMeshBenchmark() -> Never { MeshBenchmark.run() }
+}

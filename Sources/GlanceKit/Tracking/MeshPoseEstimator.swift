@@ -18,11 +18,12 @@ struct MeshModelPaths {
     static func locate() -> MeshModelPaths? {
         var dirs = [URL]()
         if let env = ProcessInfo.processInfo.environment["GLANCE_MESH_MODELS"] { dirs.append(URL(fileURLWithPath: env)) }
-        dirs.append(Bundle.module.resourceURL!.appendingPathComponent("Models"))
         if let r = Bundle.main.resourceURL {
             dirs.append(r.appendingPathComponent("GlanceSwitch_GlanceKit.bundle/Models"))
             dirs.append(r.appendingPathComponent("Models"))
         }
+        // Last: SwiftPM's accessor traps if its bundle is missing, so only touch it after the packaged paths.
+        dirs.append(Bundle.module.resourceURL!.appendingPathComponent("Models"))
         for d in dirs {
             let a = d.appendingPathComponent("face_detector.onnx").path
             let b = d.appendingPathComponent("face_landmarks_detector.onnx").path
