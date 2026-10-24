@@ -27,7 +27,7 @@ enum CalibrationCopy {
     static func verifyHeader(_ i: Int, of n: Int) -> String { n > 1 ? "Verifying  ·  \(i) of \(n)" : "Verifying" }
     static let allSetTitle = "You're all set"
     static func allSetSubtitle(screens n: Int) -> String {
-        n > 1 ? "Glance will now follow your gaze across \(n) screens." : "Glance will now follow your gaze."
+        n > 1 ? "GazeHop will now follow your gaze across \(n) screens." : "GazeHop will now follow your gaze."
     }
     static let allSetHint = "Press Return to finish"
     static func screenOK(_ name: String) -> String { "\(name) looks good" }
@@ -194,6 +194,7 @@ final class CalibrationOverlayView: NSView {
     private var lastFace: Bool?
     private var lastHighlight: NSColor?
     private var eyesAccent = false
+    private var dimmed: (header: Bool, chip: Bool) = (false, false)
 
     private static let ringRadius: CGFloat = 36
     private static let glide = CAMediaTimingFunction(controlPoints: 0.22, 1, 0.36, 1)
@@ -484,6 +485,7 @@ final class CalibrationOverlayView: NSView {
     func showDot(at p: CGPoint, animated: Bool, fromHidden: Bool, eyesOnly: Bool = false) {
         if eyesOnly != eyesAccent { setAccent(eyes: eyesOnly) }
         resetArc()
+        dimChrome(near: p)
         let hidden = fromHidden || target.opacity < 0.5
         let from = target.presentation()?.position ?? target.position
         CATransaction.begin(); CATransaction.setDisableActions(true)
@@ -510,7 +512,23 @@ final class CalibrationOverlayView: NSView {
         }
     }
 
+    /// Fades the header / face chip to 15% while the target is within 250 pt of them, so they never pull the eye.
+    private func dimChrome(near p: CGPoint?) {
+        let w = bounds.width
+        func near(_ c: CGPoint) -> Bool { p.map { hypot($0.x - c.x, $0.y - c.y) < 250 } ?? false }
+        let now = (header: near(CGPoint(x: 140, y: 22)), chip: near(CGPoint(x: w - 115, y: 21)))
+        guard now != dimmed else { return }
+        dimmed = now
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.25
+            header.animator().alphaValue = now.header ? 0.15 : 1
+            chip.animator().alphaValue = now.chip ? 0.15 : 1
+            face.animator().alphaValue = now.chip ? 0.15 : 1
+        }
+    }
+
     func hideDot() {
+        dimChrome(near: nil)
         guard target.opacity != 0 else { return }
         CATransaction.begin(); CATransaction.setAnimationDuration(0.2)
         target.opacity = 0
