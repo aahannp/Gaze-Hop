@@ -1,12 +1,18 @@
 #!/bin/bash
-# Build, bundle and sign GlanceSwitch.app.   ./build.sh [install]
+# Build, bundle and sign GazeHop, and package it as a disk image.   ./build.sh [install]
+#   ./build.sh            -> build/GazeHop-<version>.dmg (the only thing left in build/)
+#   ./build.sh install    -> also installs /Applications/GazeHop.app and launches it
+# The .app itself only ever exists in a temporary staging dir (deleted on exit) and, after `install`, in
+# /Applications — never as a stray copy in build/ or ~/Applications. Version comes from the VERSION file.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP_NAME=GlanceSwitch
-BUNDLE_ID=com.aahan.glanceswitch
+APP_NAME=GazeHop                  # bundle + executable name (the SwiftPM product is still GlanceSwitch)
+PRODUCT=GlanceSwitch
+BUNDLE_ID=com.aahan.glanceswitch  # unchanged on purpose: keeps camera / Accessibility grants and settings
 CERT_NAME="GlanceSwitch Dev"
-APP="build/$APP_NAME.app"
+VERSION="$(tr -d '[:space:]' < VERSION)"
+BUILD_NUMBER="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
 
 find_identity() {
   # SIGN_IDENTITY env var overrides (e.g. an Apple Development cert name or hash).
@@ -42,11 +48,11 @@ CFG
 
 echo "==> swift build -c release"
 swift build -c release
-BIN="$(swift build -c release --show-bin-path)/$APP_NAME"
+BIN="$(swift build -c release --show-bin-path)/$PRODUCT"
 
 # ~/Desktop is iCloud-synced: Finder info / resource forks get attached to files there and make codesign
 # fail ("detritus"). Assemble and sign in a non-synced staging dir, then copy the signed bundle out.
-STAGE="$(mktemp -d "${TMPDIR:-/tmp}/glanceswitch-build.XXXXXX")"
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/gazehop-build.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
 SAPP="$STAGE/$APP_NAME.app"
 COPY=(ditto --norsrc --noextattr)
@@ -55,6 +61,8 @@ echo "==> assembling $SAPP"
 mkdir -p "$SAPP/Contents/MacOS" "$SAPP/Contents/Resources/Models"
 "${COPY[@]}" "$BIN" "$SAPP/Contents/MacOS/$APP_NAME"
 "${COPY[@]}" Resources/Info.plist "$SAPP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" -c "Set :CFBundleVersion $BUILD_NUMBER" \
+  "$SAPP/Contents/Info.plist"
 
 # MediaPipe mesh tracker models (MeshModelPaths.locate looks in Contents/Resources/Models).
 for m in Sources/GlanceKit/Tracking/Models/*.onnx; do
@@ -103,29 +111,33 @@ if [[ -z "$IDENTITY" ]]; then
 fi
 codesign --verify --deep --strict "$SAPP"
 
-rm -rf "$APP"; mkdir -p build
-"${COPY[@]}" "$SAPP" "$APP"
-echo "==> built $APP (signed in $STAGE)"
-
-if [[ "${1:-}" == "install" ]]; then
-  mkdir -p ~/Applications
-  pkill -x "$APP_NAME" 2>/dev/null || true
-  rm -rf ~/Applications/$APP_NAME.app
-  "${COPY[@]}" "$SAPP" ~/Applications/$APP_NAME.app
-  echo "==> installed to ~/Applications/$APP_NAME.app"
-  open ~/Applications/$APP_NAME.app
+if [[ "${REQUIRE_SIGNING:-}" == 1 && -z "$IDENTITY" ]]; then
+  echo "error: REQUIRE_SIGNING=1 but no signing identity — a release must be signed so updates verify" >&2
+  exit 1
 fi
 
-if [[ "${1:-}" == "dmg" ]]; then
-  # Drag-to-install disk image: the signed app + an /Applications shortcut. Built in the staging dir (not iCloud).
-  VERSION="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$SAPP/Contents/Info.plist" 2>/dev/null || echo 1.0)"
-  DMG_SRC="$STAGE/dmg"; DMG_OUT="$STAGE/$APP_NAME-$VERSION.dmg"
-  mkdir -p "$DMG_SRC"
-  "${COPY[@]}" "$SAPP" "$DMG_SRC/$APP_NAME.app"
-  ln -s /Applications "$DMG_SRC/Applications"
-  hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$DMG_SRC" -fs APFS -format UDZO -ov "$DMG_OUT"
-  if [[ -n "$IDENTITY" ]]; then codesign --force --sign "$IDENTITY" "$DMG_OUT"; fi
-  hdiutil verify -quiet "$DMG_OUT"
-  "${COPY[@]}" "$DMG_OUT" "build/$APP_NAME-$VERSION.dmg"
-  echo "==> dmg build/$APP_NAME-$VERSION.dmg"
+# Disk image: the signed app, an /Applications shortcut, and the window layout (background arrow + icon
+# positions) from Resources/dmg, a Finder .DS_Store template made once with dmgbuild — no Finder, no scripting.
+mkdir -p build
+rm -rf build/*.app          # older builds left a loose copy here
+DMG_SRC="$STAGE/dmg"; DMG_OUT="$STAGE/$APP_NAME-$VERSION.dmg"
+mkdir -p "$DMG_SRC"
+"${COPY[@]}" "$SAPP" "$DMG_SRC/$APP_NAME.app"
+ln -s /Applications "$DMG_SRC/Applications"
+cp Resources/dmg/DS_Store "$DMG_SRC/.DS_Store"
+cp Resources/dmg/background.tiff "$DMG_SRC/.background.tiff"
+hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$DMG_SRC" -fs APFS -format UDZO -ov "$DMG_OUT"
+if [[ -n "$IDENTITY" ]]; then codesign --force --sign "$IDENTITY" "$DMG_OUT"; fi
+hdiutil verify -quiet "$DMG_OUT"
+rm -f build/*.dmg
+"${COPY[@]}" "$DMG_OUT" "build/$APP_NAME-$VERSION.dmg"
+echo "==> built build/$APP_NAME-$VERSION.dmg (v$VERSION, build $BUILD_NUMBER)"
+
+if [[ "${1:-}" == "install" ]]; then
+  pkill -x "$APP_NAME" 2>/dev/null || true
+  pkill -x GlanceSwitch 2>/dev/null || true      # the pre-rename executable
+  rm -rf "/Applications/$APP_NAME.app" ~/Applications/GlanceSwitch.app   # also migrates the old ~/Applications copy
+  "${COPY[@]}" "$SAPP" "/Applications/$APP_NAME.app"
+  echo "==> installed /Applications/$APP_NAME.app"
+  open "/Applications/$APP_NAME.app"
 fi
