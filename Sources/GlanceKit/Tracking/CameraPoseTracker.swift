@@ -61,20 +61,11 @@ public final class CameraPoseTracker: NSObject, PoseSource, AVCaptureVideoDataOu
 
     // Touched only on videoQueue.
     private var lastFrameTime = 0.0
-    private var filters = CameraPoseTracker.makeFilters()
+    private var smoother = PoseSmoother()
     private var hadFace = false
-    private var medians = [MedianWindow](repeating: MedianWindow(size: 5), count: 8)  // spike rejection before One-Euro
     private let sequence = VNSequenceRequestHandler()
 
     public override init() { super.init() }
-
-    private static func makeFilters() -> [OneEuroFilter] {
-        // yaw, pitch, roll, cx, cy, size, eyeX, eyeY
-        let angle = OneEuroFilter(minCutoff: 0.8, beta: 0.6, dCutoff: 1.0)
-        let pos = OneEuroFilter(minCutoff: 1.5, beta: 1.0, dCutoff: 1.0)
-        let eye = OneEuroFilter(minCutoff: 1.0, beta: 1.0, dCutoff: 1.0)
-        return [angle, angle, angle, pos, pos, pos, eye, eye]
-    }
 
     // MARK: PoseSource
 
@@ -165,7 +156,7 @@ public final class CameraPoseTracker: NSObject, PoseSource, AVCaptureVideoDataOu
         lock.lock(); let still = generation == gen; lock.unlock()
         guard still else { return }
         videoQueue.sync {
-            lastFrameTime = 0; hadFace = false; filters = Self.makeFilters(); medians = medians.map { MedianWindow(size: $0.size) }
+            lastFrameTime = 0; hadFace = false; smoother.reset()
         }
         session = s; output = out
         s.startRunning()
@@ -191,7 +182,8 @@ public final class CameraPoseTracker: NSObject, PoseSource, AVCaptureVideoDataOu
 
     public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         let now = ProcessInfo.processInfo.systemUptime
-        if now - lastFrameTime < 1.0 / (Self.maxFPS + 1.0) { return }
+        // Frames arrive ~66 ms apart with jitter; a tight gate drops every other early frame.
+        if now - lastFrameTime < 0.7 / Self.maxFPS { return }
         lastFrameTime = now
         guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
@@ -206,7 +198,7 @@ public final class CameraPoseTracker: NSObject, PoseSource, AVCaptureVideoDataOu
         } catch {
             pose = nil
         }
-        if pose == nil && hadFace { filters = Self.makeFilters(); medians = medians.map { MedianWindow(size: $0.size) } }
+        if pose == nil && hadFace { smoother.reset() }
         hadFace = pose != nil
 
         DispatchQueue.main.async { [weak self] in
@@ -241,8 +233,7 @@ public final class CameraPoseTracker: NSObject, PoseSource, AVCaptureVideoDataOu
         let cx = 1 - Double(box.midX)      // flip to user's view
         let cy = 1 - Double(box.midY)      // Vision y is up; contract y is down
         let vals = [yaw, pitch, roll, cx, cy, Double(box.width), Double(eye.dx), Double(eye.dy)]
-        var out = [Double](repeating: 0, count: vals.count)
-        for i in vals.indices { out[i] = filters[i].filter(medians[i].push(vals[i]), at: t) }
+        let out = smoother.smooth(vals, at: t)
 
         return HeadPose(timestamp: t, yaw: out[0], pitch: out[1], roll: out[2],
                         faceCenter: CGPoint(x: out[3], y: out[4]), faceSize: out[5],
