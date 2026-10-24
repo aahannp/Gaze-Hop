@@ -123,7 +123,7 @@ if [[ "${1:-}" == "dmg" ]]; then
   mkdir -p "$DMG_SRC"
   "${COPY[@]}" "$SAPP" "$DMG_SRC/$APP_NAME.app"
   ln -s /Applications "$DMG_SRC/Applications"
-  hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$DMG_SRC" -fs HFS+ -format UDZO -ov "$DMG_OUT"
+  hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$DMG_SRC" -fs APFS -format UDZO -ov "$DMG_OUT"
   if [[ -n "$IDENTITY" ]]; then codesign --force --sign "$IDENTITY" "$DMG_OUT"; fi
   hdiutil verify -quiet "$DMG_OUT"
   "${COPY[@]}" "$DMG_OUT" "build/$APP_NAME-$VERSION.dmg"
