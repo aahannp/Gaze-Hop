@@ -31,6 +31,9 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var pauseItem: NSMenuItem!
     private var driftItem: NSMenuItem!
+    private var inputWarnItem: NSMenuItem!
+    private var inputStarted = false
+    private var permissionTimer: Timer?
     private var hotKey: HotKey?
     private var welcomeWindow: NSWindow?
     private var settingsWindow: NSWindow?
@@ -70,7 +73,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         observeSystemEvents()
 
         focus.startTracking()
-        input.start()
+        ensureInputMonitor()
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            self?.ensureInputMonitor()
+        }
         overlay.setVisible(store.settings.showGazeDot)
         refreshStatusIcon()
 
@@ -97,6 +103,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         pauseItem.keyEquivalentModifierMask = [.command, .shift]
         driftItem = NSMenuItem(title: "⚠︎ Accuracy dropped — Recalibrate", action: #selector(recalibrateAction), keyEquivalent: "")
         driftItem.isHidden = true
+        inputWarnItem = NSMenuItem(title: "⚠︎ Input Monitoring missing — Fix…", action: #selector(openWelcome), keyEquivalent: "")
+        inputWarnItem.target = self
+        inputWarnItem.isHidden = true
+        menu.addItem(inputWarnItem)
         menu.addItem(pauseItem)
         menu.addItem(driftItem)
         menu.addItem(item("Recalibrate", #selector(recalibrateAction)))
@@ -143,7 +153,23 @@ final class AppController: NSObject, NSApplicationDelegate {
     // MARK: Camera gating
 
     /// Camera runs only when tracking is wanted (or calibrating), and the system is awake and unlocked.
+    /// The listen-only event tap can't be created until Input Monitoring is granted, and
+    /// the monitor never retries on its own, so (re)start it whenever permission appears.
+    /// start() is idempotent.
+    private func ensureInputMonitor() {
+        let granted = Permissions.inputMonitoringGranted
+        if granted, !inputStarted {
+            input.start()
+            inputStarted = true
+        } else if !granted {
+            inputStarted = false
+        }
+        inputWarnItem?.isHidden = granted
+        if !granted { statusItem?.button?.toolTip = "Glance Switch — Input Monitoring not granted: typing protection is off" }
+    }
+
     private func updateCamera() {
+        ensureInputMonitor()
         let wantTracking = !store.settings.paused && mapper.isCalibrated
         let want = (wantTracking || calibrating) && suspendReasons.isEmpty && Permissions.cameraGranted
         if want, !tracker.isRunning {
@@ -234,6 +260,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private func startCalibration(restoreOnCancel: Bool = false) {
         guard !calibrating else { return }
         guard Permissions.cameraGranted else { showWelcome(); return }
+        ensureInputMonitor()
         driftItem.isHidden = true
         calibrating = true
         updateCamera()
@@ -276,6 +303,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         if welcomeWindow == nil {
             let view = WelcomeView { [weak self] in
                 self?.welcomeWindow?.close()
+                self?.ensureInputMonitor()
                 if self?.mapper.isCalibrated == true, !(self?.store.settings.paused ?? false) {
                     self?.updateCamera()
                 }
