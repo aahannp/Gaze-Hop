@@ -6,14 +6,61 @@ struct SettingsView: View {
     @ObservedObject var store: SettingsStore
     var onRecalibrate: () -> Void
     var onResetCalibration: () -> Void
+    var liveModel: LiveFaceModel
+    /// True when the eye model hasn't been calibrated yet (reported by the mapper, if it can).
+    var needsEyeCalibration: () -> Bool = { false }
     private let cameras = CameraPoseTracker.availableCameras()
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var loginError: String?
     @State private var confirmReset = false
 
     var body: some View {
+        TabView {
+            settingsForm.tabItem { Label("Settings", systemImage: "gearshape") }
+            LiveFacePanel(model: liveModel).tabItem { Label("Live view", systemImage: "face.smiling") }
+        }
+        .frame(width: 520, height: 700)
+    }
+
+    private var modeCaption: String {
+        switch store.settings.gazeMode {
+        case .head: return "Turn your head to switch displays. Eyes are ignored."
+        case .eyes: return "Move your eyes to switch. Your head is only used to compensate, never to decide."
+        case .both: return "Blends head and eyes. Slide toward Eyes for quick glances, toward Head for deliberate turns."
+        }
+    }
+
+    private var settingsForm: some View {
         let s = $store.settings
-        Form {
+        return Form {
+            Section("Tracking") {
+                Picker("Gaze signal", selection: s.gazeMode) {
+                    Text("Head only").tag(GazeMode.head)
+                    Text("Eyes only").tag(GazeMode.eyes)
+                    Text("Both").tag(GazeMode.both)
+                }
+                .pickerStyle(.segmented)
+                if store.settings.gazeMode == .both {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text("Head ↔ Eyes")
+                            Spacer()
+                            Text("\(Int((store.settings.eyeWeight * 100).rounded()))% eyes")
+                                .monospacedDigit().foregroundStyle(.secondary)
+                        }
+                        Slider(value: s.eyeWeight, in: 0...1, step: 0.05)
+                    }
+                }
+                Text(modeCaption).font(.caption).foregroundStyle(.secondary)
+                if store.settings.gazeMode != .head, needsEyeCalibration() {
+                    HStack {
+                        Label("Eye tracking needs a fresh calibration.", systemImage: "exclamationmark.triangle")
+                            .font(.caption).foregroundStyle(.orange)
+                        Spacer()
+                        Button("Recalibrate for eye tracking", action: onRecalibrate)
+                    }
+                }
+            }
             Section("Switching") {
                 slider("Switch delay", s.switchDelayMs, 100...1000, step: 50, unit: "ms")
                 slider("Head-turn threshold", s.headTurnThreshold, 0.1...0.9, step: 0.05, unit: nil,
@@ -56,7 +103,6 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 480, height: 640)
         .confirmationDialog("Reset calibration?", isPresented: $confirmReset) {
             Button("Reset and recalibrate", role: .destructive, action: onResetCalibration)
         } message: { Text("This deletes the learned gaze model and starts calibration again.") }
