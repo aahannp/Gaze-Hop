@@ -105,6 +105,19 @@ final class MeshBenchmark: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         emit(String(format: "yaw range deg: vision %.1f..%.1f  mesh %.1f..%.1f; eye dx range: vision %.2f..%.2f mesh %.2f..%.2f",
                     vy.min() ?? 0, vy.max() ?? 0, cy.min() ?? 0, cy.max() ?? 0, ve.min() ?? 0, ve.max() ?? 0, ce.min() ?? 0, ce.max() ?? 0))
         emit("blinks (mesh openness<0.35): \(cpu.filter { ($0.openness ?? 1) < 0.35 && $0.yaw != nil }.count)")
+        // Head leak: how much eye dx moves per 10 deg of head yaw (least squares) and how much of the eye
+        // channel's variance yaw explains. Eye-head coordination adds some; a turn with the eyes on one
+        // spot (or calibration) should read ~0 for the mesh's head-frame feature.
+        func leak(_ s: [Sample]) -> String {
+            let p = s.compactMap { x in x.yaw.flatMap { y in x.eyeDx.map { (y, $0) } } }
+            guard p.count > 10 else { return "n/a" }
+            let n = Double(p.count), my = p.map(\.0).reduce(0, +) / n, me = p.map(\.1).reduce(0, +) / n
+            let sxy = p.map { ($0.0 - my) * ($0.1 - me) }.reduce(0, +), sxx = p.map { ($0.0 - my) * ($0.0 - my) }.reduce(0, +)
+            let syy = p.map { ($0.1 - me) * ($0.1 - me) }.reduce(0, +)
+            guard sxx > 0, syy > 0 else { return "n/a" }
+            return String(format: "%+.3f per 10 deg, R2 %.2f", 10 * sxy / sxx, sxy * sxy / (sxx * syy))
+        }
+        emit("eye dx vs head yaw: vision \(leak(vis))  mesh \(leak(cpu))")
         leadReport()
     }
 

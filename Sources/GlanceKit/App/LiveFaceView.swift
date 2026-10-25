@@ -51,17 +51,21 @@ public final class LiveFaceModel: ObservableObject {
     private var lostWork: DispatchWorkItem?
     private var idleWork: DispatchWorkItem?
     private var heldEyes: (yaw: Double, pitch: Double) = (0, 0)
+    private var eyeRange = EyeAutoRange()
     private(set) var visibleCount = 0
     /// Called when the first view appears / the last one goes away (keeps the camera on while watching).
     var onVisibilityChange: (() -> Void)?
 
     init(hub: PoseHub) { self.hub = hub }
 
-    /// Holds the last eye angles while the lids are shut (the offset is unreliable then).
+    /// Holds the last eye angles while the lids are shut (the offset is unreliable then). Open-eye
+    /// offsets go through `eyeRange` first, so this user's normal eye movement fills the face and dial.
     func faceAngles(for pose: HeadPose?) -> FaceAngles {
-        var a = FaceMapping.angles(from: pose)
-        guard let p = pose else { return a }
-        if p.eyeOpenness < 0.3 { a.eyeYaw = heldEyes.yaw; a.eyePitch = heldEyes.pitch }
+        guard var p = pose else { return FaceMapping.angles(from: nil) }
+        let blink = p.eyeOpenness < 0.3
+        if !blink { p.eyeOffset = eyeRange.push(p.eyeOffset, at: p.timestamp) }
+        var a = FaceMapping.angles(from: p)
+        if blink { a.eyeYaw = heldEyes.yaw; a.eyePitch = heldEyes.pitch }
         else { heldEyes = (a.eyeYaw, a.eyePitch) }
         return a
     }
@@ -73,6 +77,9 @@ public final class LiveFaceModel: ObservableObject {
         motion.push(face: angles, at: now)
         self.pose = pose
         signals = FaceMapping.signals(from: pose)
+        if let a = angles {
+            signals.eyeX = a.eyeYaw / FaceMapping.maxEyeYaw; signals.eyeY = a.eyePitch / FaceMapping.maxEyePitch
+        }
         notePresence(pose != nil)
     }
 

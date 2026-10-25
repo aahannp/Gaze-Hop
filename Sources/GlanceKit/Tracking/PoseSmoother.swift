@@ -45,7 +45,9 @@ struct PoseSmoother {
 
 extension PoseSmoother {
     /// Mesh tracker: 478-point landmarks are far less noisy than Vision's, so almost no median
-    /// and a high One-Euro cutoff (retuned from the live benchmark).
+    /// and a high One-Euro cutoff (retuned from the live benchmark). Eye: the channel is eye rotation
+    /// (±1 = ±31 deg) and the iris is the noisiest landmark, so a lower resting cutoff; a saccade's speed
+    /// still opens the filter within a frame or two.
     static let mesh = Config(angleMedian: 1, angle: (3.0, 30.0, 3.0), position: (4.0, 5.0, 3.0),
-                             eye: (3.0, 10.0, 3.0), otherMedian: 1)
+                             eye: (1.0, 3.0, 1.0), otherMedian: 1)
 }
