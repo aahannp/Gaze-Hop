@@ -37,21 +37,30 @@ final class TrackingLatencyTests: XCTestCase {
         XCTAssertLessThan(after.jitterDeg, 1.5)
     }
 
-    /// Eye dx saccade (0 -> 0.6 step at 15 Hz, noise 0.02) through the mesh config's eye channel.
-    func testMeshEyeSaccadeLag() {
-        var s = PoseSmoother(config: PoseSmoother.mesh)
+    /// Eye saccade (0 -> 0.6, about 19 deg of eye rotation) at 15 Hz through the mesh eye channel, with
+    /// iris noise at the scale of the eye-rotation units (uniform ±0.12, std 0.07).
+    static func meshEyeSaccade(_ eye: (minCutoff: Double, beta: Double, dCutoff: Double)) -> (t90: Double, std: Double) {
+        var cfg = PoseSmoother.mesh
+        cfg.eye = eye
+        var s = PoseSmoother(config: cfg)
         var rng: UInt64 = 11
         var out = [Double]()
         for i in 0..<90 {
             rng = rng &* 6364136223846793005 &+ 1442695040888963407
-            let noise = (Double(rng >> 33) / Double(1 << 31) - 0.5) * 0.04
+            let noise = (Double(rng >> 33) / Double(1 << 31) - 0.5) * 0.24
             out.append(s.smooth([0, 0, 0, 0.5, 0.5, 0.2, (i < 30 ? 0 : 0.6) + noise, 0], at: Double(i) / 15)[6])
         }
         let t90 = out[30...].firstIndex { $0 >= 0.54 }.map { Double($0 - 30) * 1000 / 15 } ?? .infinity
-        let rest = out[10..<30]; let m = rest.reduce(0, +) / Double(rest.count)
+        let rest = out[5..<30]; let m = rest.reduce(0, +) / Double(rest.count)
         let std = (rest.map { ($0 - m) * ($0 - m) }.reduce(0, +) / Double(rest.count)).squareRoot()
-        print(String(format: "MESH eye saccade: t90 %.0f ms, rest std %.3f (raw noise std 0.012)", t90, std))
-        XCTAssertLessThanOrEqual(t90, 70)
-        XCTAssertLessThan(std, 0.02)
+        return (t90, std)
+    }
+
+    func testMeshEyeSaccadeLag() {
+        let before = Self.meshEyeSaccade((3.0, 10.0, 3.0)), after = Self.meshEyeSaccade(PoseSmoother.mesh.eye)
+        print(String(format: "MESH eye saccade: before t90 %.0f ms rest std %.3f; after t90 %.0f ms rest std %.3f (raw std 0.069)",
+                     before.t90, before.std, after.t90, after.std))
+        XCTAssertLessThanOrEqual(after.t90, 140)            // two frames
+        XCTAssertLessThan(after.std, before.std * 0.8)
     }
 }

@@ -9,7 +9,10 @@ final class TrackingMeshTests: XCTestCase {
         p[362] = SIMD3(110, 90, 0); p[263] = SIMD3(130, 90, 0)
         p[159] = SIMD3(80, 90 - lid / 2, 0); p[145] = SIMD3(80, 90 + lid / 2, 0)
         p[386] = SIMD3(120, 90 - lid / 2, 0); p[374] = SIMD3(120, 90 + lid / 2, 0)
-        p[468] = SIMD3(80 + irisDX, 90, 0); p[473] = SIMD3(120 + irisDX, 90, 0)
+        for (c, x) in [(468, 80.0), (473, 120.0)] {             // iris centre + its 4-point ring
+            p[c] = SIMD3(x + irisDX, 90, 0)
+            for (k, o) in [(3.0, 0.0), (0, 3), (-3, 0), (0, -3)].enumerated() { p[c + 1 + k] = SIMD3(x + irisDX + o.0, 90 + o.1, 0) }
+        }
         p[10] = SIMD3(100, 40, 0); p[152] = SIMD3(100, 160, 0)
         return p
     }

@@ -211,3 +211,62 @@ final class LiveFaceTests: XCTestCase {
         XCTAssertFalse(model.isIdle)                            // still easing to neutral
     }
 }
+
+/// Display-only eye stretch for the live face and the Eyes dial.
+final class EyeAutoRangeTests: XCTestCase {
+    /// 15 Hz samples: `f(t)` gives the raw offset; returns the displayed dx over the last `tail` seconds.
+    private func run(_ r: inout EyeAutoRange, secs: Double, tail: Double = 10, _ f: (Double) -> Double) -> [Double] {
+        var out: [Double] = []
+        for i in 0..<Int(secs * 15) {
+            let t = Double(i) / 15
+            let v = r.push(CGVector(dx: f(t), dy: 0), at: t).dx
+            if t >= secs - tail { out.append(v) }
+        }
+        return out
+    }
+
+    /// Apple Vision's real shape: ±0.13 glances around +0.15 (from the user's trace). The face should
+    /// show them centred and at least twice as large.
+    func testSmallOffCentreGlancesFillTheDial() {
+        var r = EyeAutoRange()
+        let shown = run(&r, secs: 60) { t in 0.15 + (Int(t / 2) % 2 == 0 ? 0.13 : -0.13) }
+        let lo = shown.min()!, hi = shown.max()!
+        print(String(format: "AUTO-RANGE vision-like: raw 0.02...0.28 -> shown %+.2f...%+.2f (gain %.2f)", lo, hi, r.gains.x))
+        XCTAssertGreaterThan(hi, 0.3); XCTAssertLessThan(lo, -0.3)
+        XCTAssertEqual((hi + lo) / 2, 0, accuracy: 0.08)
+    }
+
+    /// A signal that already fills the range (mesh, eye angle units) is only re-centred, never squashed.
+    func testLargeSignalKeepsItsScale() {
+        var r = EyeAutoRange()
+        _ = run(&r, secs: 60) { t in Int(t / 2) % 2 == 0 ? 0.6 : -0.6 }
+        XCTAssertEqual(r.gains.x, 1, accuracy: 1e-9)
+    }
+
+    /// A still gaze: noise is stretched at most `maxGain` times.
+    func testStillGazeCapsTheStretch() {
+        var r = EyeAutoRange()
+        var rng: UInt64 = 5
+        let shown = run(&r, secs: 120) { _ in
+            rng = rng &* 6364136223846793005 &+ 1442695040888963407
+            return 0.1 + (Double(rng >> 33) / Double(1 << 31) - 0.5) * 0.02
+        }
+        XCTAssertEqual(r.gains.x, r.maxGain, accuracy: 1e-9)
+        XCTAssertLessThan(shown.map(abs).max()!, 0.04)
+    }
+
+    /// The live model runs open-eye offsets through the stretch before the face and the dial see them.
+    func testLiveModelStretchesSmallEyeMovement() {
+        let model = LiveFaceModel(hub: PoseHub())
+        var yaws: [Double] = []
+        for i in 0..<900 {
+            let t = Double(i) / 15
+            let dx = 0.15 + (Int(t / 2) % 2 == 0 ? 0.13 : -0.13)
+            let p = HeadPose(timestamp: t, yaw: 0, pitch: 0, roll: 0, faceCenter: CGPoint(x: 0.5, y: 0.5), faceSize: 0.3,
+                             eyeOffset: CGVector(dx: dx, dy: 0), confidence: 1)
+            let a = model.faceAngles(for: p)
+            if t > 50 { yaws.append(a.eyeYaw / FaceMapping.maxEyeYaw) }
+        }
+        XCTAssertGreaterThan(yaws.max()! - yaws.min()!, 2 * 0.26)     // more than twice the raw swing
+    }
+}

@@ -155,6 +155,11 @@ final class MeshPoseEstimator: FramePoseEstimator {
     // MARK: pose + iris
 
     static let blinkThreshold = 0.35
+    /// Iris-centre offset per unit sine of eye rotation, in eye half-widths: the iris sits ~10.5 mm from
+    /// the eye's rotation centre and the corners are ~15 mm from the eye's middle.
+    static let irisRadiusRatio = 0.7
+    /// Eye rotation (radians) reported as eyeOffset ±1: ±31 deg, the live face's widest eye turn.
+    static let eyeFullScale = 0.55
 
     static func channels(pts: [SIMD3<Double>], w: Double, h: Double,
                          bbox: (Double, Double, Double, Double)) -> (v: [Double], open: Double) {
@@ -170,26 +175,28 @@ final class MeshPoseEstimator: FramePoseEstimator {
         let pitch = atan2(-f.y, (f.x * f.x + f.z * f.z).squareRoot())
         let roll = -atan2(xAxis.y, xAxis.x)
 
-        // Iris position inside each eye (corners + lids), image-right -> user's left.
+        // Eye-in-head rotation from the iris, measured in the 3D face frame (xAxis, down) so a head turn
+        // moves the corners and the iris together and reads as nothing. In the 2D image the iris sits in
+        // front of the corners and slid sideways with every head turn: 30 deg of head read like 13 deg of eye.
+        // Vertical is taken against the corners, not the lids: the upper lid follows the eye and cancels it.
         func eye(_ outerL: Int, _ innerR: Int, _ iris: Int, _ up: Int, _ low: Int) -> (dx: Double, dy: Double, open: Double)? {
             let a = pts[outerL], b = pts[innerR]
             let ab = b - a
             let half = (ab * ab).sum().squareRoot() / 2
             guard half > 1 else { return nil }
-            let u = SIMD3(ab.x / (2 * half), ab.y / (2 * half), 0)
-            let vDown = SIMD3(-u.y, u.x, 0)
             let mid = (a + b) / 2
-            let d = pts[iris] - mid
-            let t = (d.x * u.x + d.y * u.y) / half
-            let lidMid = (pts[up] + pts[low]) / 2
-            let lidHalf = max(abs(((pts[low] - pts[up]) * vDown).sum()) / 2, half * 0.2)
-            let dv = ((pts[iris] - lidMid) * vDown).sum() / lidHalf
+            // Iris centre: the centre point averaged with its 4-point ring (steadier than the centre alone).
+            let c = (0..<5).map { pts[iris + $0] }.reduce(SIMD3<Double>.zero, +) / 5
+            let d = c - mid
+            func angle(_ t: Double) -> Double { asin(max(-1, min(1, t / Self.irisRadiusRatio))) / Self.eyeFullScale }
+            let h = angle((d * xAxis).sum() / half), v = angle((d * down).sum() / half)
             // Eye aspect ratio: lid gap / eye width (~0.28 open, <0.12 closed).
-            let ear = abs(((pts[low] - pts[up]) * vDown).sum()) / (2 * half)
+            let ear = abs(((pts[low] - pts[up]) * down).sum()) / (2 * half)
             let open = max(0, min(1, (ear - 0.12) / 0.14))
-            return (max(-1, min(1, -t)), max(-1, min(1, -dv)), open)
+            return (max(-1, min(1, -h)), max(-1, min(1, -v)), open)
         }
-        // person's right eye = image-left: corners 33 (outer) .. 133 (inner); left eye: 362 (inner) .. 263 (outer)
+        // person's right eye = image-left: corners 33 (outer) .. 133 (inner), iris 468 + ring 469-472;
+        // left eye: 362 (inner) .. 263 (outer), iris 473 + ring 474-477.
         let e = [eye(33, 133, 468, 159, 145), eye(362, 263, 473, 386, 374)].compactMap { $0 }
         let wsum = e.map(\.open).reduce(0, +)
         let openness = e.isEmpty ? 0 : wsum / Double(e.count)

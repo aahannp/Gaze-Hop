@@ -53,6 +53,45 @@ public enum FaceMapping {
     }
 }
 
+/// Display-only eye range: re-centres the eye offset on where this user usually looks and stretches
+/// their normal eye movement to fill the dial. Apple Vision's offset spans about ±0.13 around +0.15 for a
+/// glance between two displays, which barely moved the live face's eyes. Switching never sees this; the
+/// gaze mapper learns the real scale during calibration.
+public struct EyeAutoRange {
+    /// Seconds for the centre and the spread to follow a new habit.
+    public var centerTau = 8.0, spreadTau = 20.0
+    /// Mean |offset - centre| that the stretched signal settles at, and the most it may be stretched
+    /// (caps how much tracker noise a still gaze can show).
+    public var targetSpread = 0.3, maxGain = 3.0
+
+    private var center: (x: Double, y: Double)?
+    private var spread = (x: 0.0, y: 0.0)
+    private var lastT = 0.0
+
+    public init() {}
+
+    public mutating func reset() { center = nil; spread = (0, 0) }
+
+    /// Feed one open-eye sample (`t` in seconds); returns the stretched, re-centred offset.
+    public mutating func push(_ e: CGVector, at t: Double) -> CGVector {
+        let x = Double(e.dx), y = Double(e.dy)
+        guard let c = center else {
+            center = (x, y); spread = (targetSpread, targetSpread); lastT = t   // start at gain 1
+            return .zero
+        }
+        let dt = min(max(t - lastT, 0), 1); lastT = t
+        let ac = 1 - exp(-dt / centerTau), asp = 1 - exp(-dt / spreadTau)
+        let nc = (x: c.x + ac * (x - c.x), y: c.y + ac * (y - c.y))
+        center = nc
+        spread = (spread.x + asp * (abs(x - nc.x) - spread.x), spread.y + asp * (abs(y - nc.y) - spread.y))
+        return CGVector(dx: (x - nc.x) * gain(spread.x), dy: (y - nc.y) * gain(spread.y))
+    }
+
+    /// Current stretch for one axis (1 = unchanged).
+    public func gain(_ s: Double) -> Double { min(maxGain, max(1, targetSpread / max(s, 1e-6))) }
+    public var gains: (x: Double, y: Double) { (gain(spread.x), gain(spread.y)) }
+}
+
 /// Mini-map of the displays drawn to scale inside `size`.
 public struct MiniMapLayout: Equatable {
     public let scale: CGFloat

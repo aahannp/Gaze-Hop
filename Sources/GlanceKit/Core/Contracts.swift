@@ -23,7 +23,7 @@ public struct HeadPose: Equatable {
     public var roll: Double              // radians, + = clockwise from user's view
     public var faceCenter: CGPoint       // normalized 0...1 in frame, x + = user's right, y + = down
     public var faceSize: Double          // face bbox width / frame width (distance proxy, bigger = closer)
-    public var eyeOffset: CGVector       // mean pupil offset inside eye boxes, -1...1, dx + = user's right, dy + = up
+    public var eyeOffset: CGVector       // eyes within the head, -1...1, dx + = user's right, dy + = up (mesh: eye rotation, ±1 = ±31°; Vision: pupil inside the eye box)
     public var confidence: Double        // 0...1
     /// 0 = eyes closed (blink), 1 = fully open. Trackers that can't measure it leave 1.
     /// While it is low, `eyeOffset` is unreliable and consumers should hold the last eye value.
