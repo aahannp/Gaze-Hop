@@ -25,7 +25,7 @@ public final class Updater: ObservableObject {
     public static let shared = Updater()
 
     /// GitHub `owner/repo` whose latest release is checked.
-    public static let repo = "aahannp/gazehop"
+    public static let repo = "aahannp/Gaze-Hop"
 
     @Published public private(set) var state: UpdateState = .idle
     @Published public private(set) var lastChecked: Date?

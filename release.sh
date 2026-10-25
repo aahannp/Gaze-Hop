@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-REPO=aahannp/gazehop
+REPO=aahannp/Gaze-Hop
 command -v gh >/dev/null || { echo "error: gh is not installed (brew install gh)" >&2; exit 1; }
 gh auth status >/dev/null 2>&1 || { echo "error: not logged in — run: gh auth login" >&2; exit 1; }
 [[ -z "$(git status --porcelain)" ]] || { echo "error: working tree is not clean; commit or stash first" >&2; exit 1; }

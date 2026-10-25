@@ -27,7 +27,7 @@ final class UpdaterTests: XCTestCase {
         return Updater(session: URLSession(configuration: cfg), apiBase: "https://api.test", webBase: "https://web.test", version: version)
     }
 
-    func release(tag: String, assets: String = #"[{"name":"GazeHop-0.3.0.dmg","browser_download_url":"https://github.com/aahannp/gazehop/releases/download/v0.3.0/GazeHop-0.3.0.dmg","size":1234}]"#) -> Data {
+    func release(tag: String, assets: String = #"[{"name":"GazeHop-0.3.0.dmg","browser_download_url":"https://github.com/aahannp/Gaze-Hop/releases/download/v0.3.0/GazeHop-0.3.0.dmg","size":1234}]"#) -> Data {
         Data(#"{"tag_name":"\#(tag)","body":"Fixes","html_url":"https://github.com/x","draft":false,"assets":\#(assets)}"#.utf8)
     }
 
@@ -63,7 +63,7 @@ final class UpdaterTests: XCTestCase {
 
     func testDownloadHostAllowList() {
         func ok(_ s: String) -> Bool { UpdateLogic.isAllowedDownloadURL(URL(string: s)!) }
-        XCTAssertTrue(ok("https://github.com/aahannp/gazehop/releases/download/v1/x.dmg"))
+        XCTAssertTrue(ok("https://github.com/aahannp/Gaze-Hop/releases/download/v1/x.dmg"))
         XCTAssertTrue(ok("https://objects.githubusercontent.com/abc"))
         XCTAssertTrue(ok("https://release-assets.githubusercontent.com/abc"))
         XCTAssertFalse(ok("http://github.com/x.dmg"))
@@ -75,9 +75,9 @@ final class UpdaterTests: XCTestCase {
     }
 
     func testRedirectTagParsing() {
-        XCTAssertEqual(UpdateLogic.tag(fromReleaseRedirect: "https://github.com/aahannp/gazehop/releases/tag/v0.3.0"), "v0.3.0")
-        XCTAssertEqual(UpdateLogic.tag(fromReleaseRedirect: "/aahannp/gazehop/releases/tag/v0.3.0?x=1"), "v0.3.0")
-        XCTAssertNil(UpdateLogic.tag(fromReleaseRedirect: "https://github.com/aahannp/gazehop/releases"))
+        XCTAssertEqual(UpdateLogic.tag(fromReleaseRedirect: "https://github.com/aahannp/Gaze-Hop/releases/tag/v0.3.0"), "v0.3.0")
+        XCTAssertEqual(UpdateLogic.tag(fromReleaseRedirect: "/aahannp/Gaze-Hop/releases/tag/v0.3.0?x=1"), "v0.3.0")
+        XCTAssertNil(UpdateLogic.tag(fromReleaseRedirect: "https://github.com/aahannp/Gaze-Hop/releases"))
         XCTAssertNil(UpdateLogic.tag(fromReleaseRedirect: nil))
     }
 
@@ -105,7 +105,7 @@ final class UpdaterTests: XCTestCase {
         await u.refresh(silent: false)
         XCTAssertEqual(u.state, .available(version: "0.3.0", notes: "Fixes"))
         XCTAssertNotNil(u.lastChecked)
-        XCTAssertEqual(MockURLProtocol.requests, ["https://api.test/repos/aahannp/gazehop/releases/latest"])
+        XCTAssertEqual(MockURLProtocol.requests, ["https://api.test/repos/aahannp/Gaze-Hop/releases/latest"])
     }
 
     func testCheckUpToDateAndCache() async {
@@ -128,12 +128,12 @@ final class UpdaterTests: XCTestCase {
         let u = makeUpdater()
         MockURLProtocol.handler = { req in
             if req.url!.host == "api.test" { return (403, [:], Data(#"{"message":"rate limit"}"#.utf8)) }
-            return (302, ["Location": "https://web.test/aahannp/gazehop/releases/tag/v0.4.0"], Data())
+            return (302, ["Location": "https://web.test/aahannp/Gaze-Hop/releases/tag/v0.4.0"], Data())
         }
         await u.refresh(silent: false)
         XCTAssertEqual(u.state, .available(version: "0.4.0", notes: ""))
         let r = try? await u.fetchLatest(force: false)
-        XCTAssertEqual(r?.asset?.url, "https://web.test/aahannp/gazehop/releases/download/v0.4.0/GazeHop-0.4.0.dmg")
+        XCTAssertEqual(r?.asset?.url, "https://web.test/aahannp/Gaze-Hop/releases/download/v0.4.0/GazeHop-0.4.0.dmg")
     }
 
     func testFailureReportsAndSilentCheckKeepsState() async {
